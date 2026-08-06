@@ -1,0 +1,66 @@
+#!/bin/bash
+# pre-commit — refuse to commit anything that looks like a credential.
+#
+# This repo was created on a machine where KEYRING found a live z.ai API
+# key sitting in QGLM/.env at mode 644. .gitignore covers the known cases,
+# but .gitignore is a policy about *paths*; this hook is a check on
+# *content*, which is what actually matters. Git history is permanent, so
+# a leaked key is not fixed by a later commit.
+#
+# Bypass (only if you are certain it is a placeholder):
+#     git commit --no-verify
+set -uo pipefail
+
+fail=0
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+[ -z "$staged" ] && exit 0
+
+# Provider-specific signatures. Deliberately narrow: a generic
+# high-entropy matcher would fire on every hash and lock file and get
+# disabled within a week, which is worse than no hook at all.
+patterns=(
+  'sk-[A-Za-z0-9]{32,}'                 # OpenAI
+  'sk-ant-[A-Za-z0-9_-]{32,}'           # Anthropic
+  'gh[pousr]_[A-Za-z0-9]{36,}'          # GitHub
+  'github_pat_[A-Za-z0-9_]{40,}'
+  'xox[baprs]-[A-Za-z0-9-]{10,}'        # Slack
+  'AIza[A-Za-z0-9_-]{35}'               # Google
+  'AKIA[0-9A-Z]{16}'                    # AWS
+  '[0-9a-f]{32}\.[A-Za-z0-9]{16}'       # z.ai
+  'sk-or-v1-[0-9a-f]{48,}'              # OpenRouter
+  'glpat-[A-Za-z0-9_-]{20,}'            # GitLab
+  'BEGIN (RSA |EC |OPENSSH |PGP )?PRIVATE KEY'
+)
+
+for f in $staged; do
+  # Skip binaries and this hook itself (it contains the patterns).
+  case "$f" in
+    *.git/hooks/*) continue ;;
+  esac
+  git show ":$f" 2>/dev/null | grep -Iq . || continue
+
+  content=$(git show ":$f" 2>/dev/null)
+  for p in "${patterns[@]}"; do
+    hits=$(printf '%s' "$content" | grep -nE "$p" | \
+           grep -viE 'example|placeholder|your[_-]|xxxx|changeme|dummy|redacted|<.*>|\$\{' || true)
+    if [ -n "$hits" ]; then
+      echo "BLOCKED: possible credential in $f"
+      echo "$hits" | head -3 | sed 's/^/    /' | cut -c1-100
+      fail=1
+    fi
+  done
+done
+
+if [ "$fail" -ne 0 ]; then
+  cat <<'EOF'
+
+Commit refused: staged content matches a credential signature.
+
+  * If this is a real secret: remove it, and rotate the key. It was on
+    disk in a file you were about to publish.
+  * If it is genuinely a placeholder: rename it to something containing
+    "example" or "placeholder", or commit with --no-verify.
+EOF
+  exit 1
+fi
+exit 0

@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""keyring-app — MCP Apps server for KEYRING (SEP-1865).
+
+Why this exists
+---------------
+The KEYRING CLI never shows a secret value. That is a real guarantee, and
+it costs real usability: you see `bc9…` and a fingerprint, so you cannot
+actually *use* the credential you just found without going and opening
+the file yourself.
+
+MCP Apps dissolves that tradeoff. The view runs in a sandboxed iframe that
+is not the model's context window, so:
+
+    the VIEW may reveal a secret value to the human, on explicit click
+    the MODEL still only ever sees fingerprints
+
+The `reveal_secret` tool is declared `visibility: ["app"]`, which per
+SEP-1865 means the host MUST NOT list it to the model and MUST reject
+model-originated calls to it. The sandbox boundary now enforces what
+redaction was approximating, and it enforces it better: the model cannot
+call the tool at all, rather than merely being handed pre-masked text.
+
+Two rules this server keeps:
+  * No tool that the model can call ever returns a secret value.
+  * Revealed values are never written to model context. The view does not
+    call ui/update-model-context with a secret, and the reveal tool's own
+    text content is a value only the app will read.
+"""
+
+import json
+import os
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(HERE), "lib"))
+sys.path.insert(0, HERE)
+
+from mcpkit import Server, JsonRpcError, log  # noqa: E402
+from uikit import page  # noqa: E402
+
+# Reuse the scanner itself rather than reimplementing detection. The CLI
+# is not a module (no .py suffix), so load it by path.
+import importlib.util  # noqa: E402
+
+_spec = importlib.util.spec_from_loader(
+    "keyring_cli",
+    importlib.machinery.SourceFileLoader("keyring_cli",
+                                         os.path.join(HERE, "keyring")))
+keyring_cli = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(keyring_cli)
+
+
+VIEW_URI = "ui://keyring/inventory"
+
+VIEW_CSS = """
+.grp { border:1px solid var(--color-border-primary); border-radius:var(--border-radius-md);
+       margin-bottom:8px; overflow:hidden; }
+.grp-h { display:flex; align-items:center; gap:10px; padding:9px 12px;
+         background:var(--color-background-secondary); cursor:pointer; }
+.grp-h:hover { background:var(--color-background-tertiary); }
+.prov { font-weight:600; min-width:96px; }
+.locs { padding:4px 12px 10px; }
+.loc { display:flex; align-items:center; gap:8px; padding:5px 0;
+       border-top:1px solid var(--color-border-secondary); font-size:12px; }
+.loc:first-child { border-top:none; }
+.path { font-family:var(--font-mono); font-size:11.5px; word-break:break-all; flex:1; }
+.val { font-family:var(--font-mono); font-size:11.5px; padding:7px 9px; margin-top:6px;
+       background:var(--color-background-tertiary); border-radius:var(--border-radius-sm);
+       word-break:break-all; user-select:all; }
+.warnbar { padding:9px 12px; border-radius:var(--border-radius-md);
+           background:var(--color-background-danger); color:var(--color-text-danger);
+           margin-bottom:10px; font-size:13px; }
+.filters { display:flex; gap:6px; margin-bottom:10px; flex-wrap:wrap; }
+.filters button.on { background:var(--color-text-primary);
+                     color:var(--color-background-primary); border-color:transparent; }
+.chev { color:var(--color-text-tertiary); font-size:11px; width:10px; }
+.spacer { flex:1; }
+"""
+
+VIEW_BODY = """
+<div class="hdr">
+  <h1>Credential inventory</h1>
+  <span class="muted tiny" id="summary"></span>
+</div>
+<div id="warn"></div>
+<div class="filters">
+  <button data-f="all" class="on">All</button>
+  <button data-f="exposed">Exposed</button>
+  <button data-f="dupes">Duplicated</button>
+  <div class="spacer"></div>
+  <button id="fixall" title="chmod 600 every world-readable file">Fix permissions…</button>
+</div>
+<div id="list" class="loading">loading…</div>
+<p class="tiny muted" style="margin-top:12px">
+  Values stay in this sandbox. The model only ever receives fingerprints.
+</p>
+"""
+
+VIEW_JS = r"""
+let SECRETS = [], FILTER = 'all';
+
+const band = (g) => g.exposed ? ['danger','EXPOSED']
+  : g.copies > 1 ? ['warn','SPREAD']
+  : g.group_exposed ? ['warn','GROUP'] : ['neutral','SINGLE'];
+
+function shown() {
+  if (FILTER === 'exposed') return SECRETS.filter(g => g.exposed || g.group_exposed);
+  if (FILTER === 'dupes')   return SECRETS.filter(g => g.copies > 1);
+  return SECRETS;
+}
+
+function render() {
+  const list = document.getElementById('list');
+  const gs = shown();
+  const exposed = SECRETS.filter(g => g.exposed).length;
+  document.getElementById('summary').textContent =
+    SECRETS.length + ' distinct · ' + exposed + ' world-readable';
+  document.getElementById('warn').innerHTML = exposed
+    ? '<div class="warnbar"><b>' + exposed + '</b> credential' + (exposed>1?'s are':' is') +
+      ' readable by every process on this machine.</div>' : '';
+  if (!gs.length) { list.className = 'empty'; list.textContent = 'nothing matches'; return; }
+  list.className = '';
+  list.innerHTML = gs.map((g, i) => {
+    const [cls, label] = band(g);
+    const locs = g.locations.map(l => `
+      <div class="loc">
+        <span class="path">${esc(l.path)}<span class="muted">:${l.line}</span></span>
+        <span class="pill ${l.world_readable ? 'danger' : 'neutral'}">${l.mode.slice(-3)}</span>
+        ${l.world_readable ? `<button data-fix="${esc(l.path)}">chmod 600</button>` : ''}
+      </div>`).join('');
+    return `
+      <div class="grp">
+        <div class="grp-h" data-toggle="${i}">
+          <span class="chev" id="chev-${i}">▸</span>
+          <span class="pill ${cls}">${label}</span>
+          <span class="prov">${esc(g.provider)}</span>
+          <span class="muted tiny mono">${esc(g.hint)} ${g.length}ch</span>
+          <div class="spacer"></div>
+          <span class="muted tiny">${g.copies} location${g.copies>1?'s':''}</span>
+          <button data-reveal="${esc(g.fp)}">Reveal</button>
+        </div>
+        <div class="locs" id="locs-${i}" style="display:none">${locs}
+          <div id="val-${esc(g.fp)}"></div>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+document.addEventListener('click', async (e) => {
+  const t = e.target;
+
+  const f = t.getAttribute && t.getAttribute('data-f');
+  if (f) {
+    FILTER = f;
+    document.querySelectorAll('.filters button[data-f]')
+      .forEach(b => b.classList.toggle('on', b.getAttribute('data-f') === f));
+    render(); return;
+  }
+
+  const tog = t.closest && t.closest('[data-toggle]');
+  if (tog && !t.hasAttribute('data-reveal')) {
+    const i = tog.getAttribute('data-toggle');
+    const el = document.getElementById('locs-' + i);
+    const open = el.style.display !== 'none';
+    el.style.display = open ? 'none' : 'block';
+    document.getElementById('chev-' + i).textContent = open ? '▸' : '▾';
+    return;
+  }
+
+  const fp = t.getAttribute && t.getAttribute('data-reveal');
+  if (fp) {
+    e.stopPropagation();
+    const box = document.getElementById('val-' + fp);
+    if (box.dataset.shown === '1') {
+      box.innerHTML = ''; box.dataset.shown = '0'; t.textContent = 'Reveal'; return;
+    }
+    t.disabled = true; t.textContent = 'Revealing…';
+    try {
+      // App-only tool: the model cannot call this and never sees the result.
+      const res = await MCP.callTool('reveal_secret', { fingerprint: fp });
+      const data = structuredOf(res) || {};
+      box.innerHTML = '<div class="val">' + esc(data.value || '(not found)') + '</div>' +
+        '<div class="tiny muted" style="margin-top:4px">select to copy · never sent to the model</div>';
+      box.dataset.shown = '1';
+      t.textContent = 'Hide';
+    } catch (err) {
+      box.innerHTML = '<div class="tiny" style="color:var(--color-text-danger)">' +
+        esc(err.message) + '</div>';
+    } finally { t.disabled = false; }
+    return;
+  }
+
+  const fix = t.getAttribute && t.getAttribute('data-fix');
+  if (fix) {
+    t.disabled = true; t.textContent = '…';
+    try {
+      await MCP.callTool('tighten_permissions', { path: fix });
+      await refresh();
+    } catch (err) { t.textContent = 'failed'; }
+    return;
+  }
+
+  if (t.id === 'fixall') {
+    const paths = [...new Set(SECRETS.flatMap(g =>
+      g.locations.filter(l => l.world_readable).map(l => l.path)))];
+    if (!paths.length) return;
+    t.disabled = true; t.textContent = 'Fixing ' + paths.length + '…';
+    try {
+      for (const p of paths) await MCP.callTool('tighten_permissions', { path: p });
+      await refresh();
+      // Summary only — no values, safe for model context.
+      MCP.updateContext('Tightened permissions to 0600 on ' + paths.length +
+        ' credential file(s): ' + paths.join(', '));
+    } finally { t.disabled = false; t.textContent = 'Fix permissions…'; }
+  }
+});
+
+async function refresh() {
+  const res = await MCP.callTool('scan_credentials', {});
+  const data = structuredOf(res) || {};
+  SECRETS = data.secrets || [];
+  render();
+}
+
+(async () => {
+  await MCP.init({ name: 'keyring-view' });
+  onToolData(({ result }) => {
+    const data = structuredOf(result);
+    if (data && data.secrets) { SECRETS = data.secrets; render(); }
+  });
+})();
+"""
+
+
+# ------------------------------------------------------------------ server
+
+srv = Server(
+    "keyring",
+    instructions=(
+        "Audits credentials on this machine. Secret VALUES are never "
+        "returned to the model — only provider, salted fingerprint, "
+        "location and file permissions. Use scan_credentials to inventory."),
+)
+
+srv.resource(
+    VIEW_URI, "Credential Inventory",
+    page("KEYRING", VIEW_BODY, VIEW_CSS, VIEW_JS),
+    description="Interactive credential inventory with in-sandbox reveal.",
+    csp={},                 # no external origins: keeps the restrictive default
+    prefers_border=True,
+)
+
+
+def _scan(roots=None):
+    findings, nfiles = keyring_cli.sweep(roots or keyring_cli.user_homes())
+    groups = keyring_cli.group_by_secret(findings)
+    return groups, nfiles
+
+
+@srv.tool(
+    "scan_credentials",
+    "Inventory every credential on this machine: provider, how many places "
+    "each lives, file permissions, and which are world-readable. Returns "
+    "fingerprints, never secret values.",
+    {"type": "object", "properties": {
+        "roots": {"type": "array", "items": {"type": "string"},
+                  "description": "Directories to scan; defaults to all user homes."}}},
+    resource_uri=VIEW_URI,
+)
+def scan_credentials(roots=None):
+    groups, nfiles = _scan(roots)
+    exposed = [g for g in groups if g["exposed"]]
+    dupes = [g for g in groups if g["copies"] > 1]
+
+    lines = [f"Scanned {nfiles:,} config files.",
+             f"Found {len(groups)} distinct credentials; "
+             f"{len(exposed)} world-readable, {len(dupes)} duplicated.", ""]
+    for g in groups:
+        flags = []
+        if g["exposed"]:
+            flags.append("WORLD-READABLE")
+        if g["copies"] > 1:
+            flags.append(f'{g["copies"]} copies')
+        lines.append(
+            f'- {g["provider"]} [{g["fp"]}] {" ".join(flags) or "single location"}')
+        for loc in g["locations"]:
+            lines.append(f'    {loc["path"]}:{loc["line"]} mode {loc["mode"][-3:]}')
+    if exposed:
+        lines += ["", "Fix world-readable files with: chmod 600 <path>"]
+
+    # structuredContent drives the view; the text block is the graceful
+    # degradation path for text-only hosts. Neither contains a value.
+    return "\n".join(lines), {"secrets": groups, "files_scanned": nfiles}
+
+
+@srv.tool(
+    "reveal_secret",
+    "Return the plaintext value of one credential, identified by "
+    "fingerprint. App-only: callable from the KEYRING view, never by the "
+    "model.",
+    {"type": "object",
+     "properties": {"fingerprint": {"type": "string"}},
+     "required": ["fingerprint"]},
+    visibility=["app"],   # host MUST hide this from the model
+)
+def reveal_secret(fingerprint):
+    """Re-read the file and return the matching line's secret.
+
+    The value is deliberately NOT stored anywhere between the scan and
+    this call: we re-derive it from disk so nothing lingers in memory or
+    in a cache that could later be serialized into a transcript."""
+    findings, _ = keyring_cli.sweep(keyring_cli.user_homes())
+    match = next((f for f in findings if f["fp"] == fingerprint), None)
+    if not match:
+        raise JsonRpcError(-32602, "unknown fingerprint")
+    try:
+        with open(match["path"], "r", encoding="utf-8", errors="replace") as fh:
+            line = fh.read().split("\n")[match["line"] - 1]
+    except (OSError, IndexError):
+        raise JsonRpcError(-32603, "could not re-read source file")
+
+    value = ""
+    for provider, rx in keyring_cli.COMPILED:
+        m = rx.search(line)
+        if m and keyring_cli.fingerprint(m.group("v")) == fingerprint:
+            value = m.group("v")
+            break
+    if not value:
+        raise JsonRpcError(-32603, "value no longer present at that location")
+
+    log(f"[keyring] revealed {fingerprint} to app (not to model)")
+    # Text content here is read by the app, not surfaced to the model:
+    # the host rejects model-originated calls to app-only tools.
+    return value, {"value": value, "provider": match["provider"],
+                   "path": match["path"], "line": match["line"]}
+
+
+@srv.tool(
+    "tighten_permissions",
+    "chmod 600 a credential file so only its owner can read it.",
+    {"type": "object", "properties": {"path": {"type": "string"}},
+     "required": ["path"]},
+)
+def tighten_permissions(path):
+    # Only ever narrows access, and only for a file we actually flagged.
+    findings, _ = keyring_cli.sweep(keyring_cli.user_homes())
+    known = {f["path"] for f in findings}
+    if path not in known:
+        raise JsonRpcError(-32602,
+                           "refusing to chmod a file with no detected credential")
+    try:
+        os.chmod(path, 0o600)
+    except OSError as e:
+        raise JsonRpcError(-32603, f"chmod failed: {e}")
+    log(f"[keyring] chmod 600 {path}")
+    return f"Set {path} to mode 600 (owner read/write only).", {"path": path,
+                                                                "mode": "0o600"}
+
+
+if __name__ == "__main__":
+    srv.serve()

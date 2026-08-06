@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+"""SALVAGER — find the work you haven't saved yet.
+
+Walks every git repo on this machine and reports what would vanish if the
+disk died right now: uncommitted edits, unpushed commits, stashes, and
+branches that exist nowhere but here. Ranked by how much you'd lose.
+
+    salvager                   scan and rank everything at risk
+    salvager --all             include clean repos in the listing
+    salvager --roots A:B       scan specific roots instead of the defaults
+    salvager --brief           one line per repo, no detail
+    salvager explain           GLM triages the riskiest findings
+    salvager --json            machine-readable, for scripts
+    salvager --help            usage
+
+Read-only by construction: SALVAGER runs no git command that writes. It
+will never commit, push, stash or checkout on your behalf. The whole
+point is to tell you what to save; deciding how is yours.
+
+Zero dependencies. Config shared with qglm (~/.qglm.yaml / QGLM_API_KEY).
+"""
+
+import argparse
+import concurrent.futures
+import json
+import os
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib"))
+
+from clikit import (C, call_glm, clipboard_copy, frame, hero_block,  # noqa: E402
+                    human_age, load_config, merge_usage, run, stat_line,
+                    telemetry_line, term_width, tilde, user_homes,
+                    wrap_block)
+
+# "salvager" in a heavy block face, one ramp shade per row
+HERO = r"""
+ ▄▀▀▀▀▀▀▀█   ▄▀▀▀▀▀▄   █      █   █  █  ▄▀▀▀▀▀▄   ▄▀▀▀▀▀▄   █▀▀▀▀▀▄   █▀▀▀▀▀▄
+█   ▄▄▄▄▄█  █       █  █      █   █  █  █     █  █       █  █      █  █      █
+█  ▀▄▄▄▄    █▄▄▄▄▄▄▄█  █      ▀▄ ▄▀  █  █▄▄▄▄▄█  █▄▄▄▄▄▄▄█  █▄▄▄▄▄▀   █▄▄▄▄▄▀
+ ▀▄▄▄▄▄ ▀▄  █       █  █        █    █  █     █  █       █  █     ▀▄  █   ▀▄
+ ▄▄▄▄▄▄▄▄▀  █       █  █▄▄▄▄▄▄  █    █  █     █  █       █  █      █  █     █
+""".strip("\n")
+
+# amber → deep red ramp: this tool reports risk
+RAMP = (222, 214, 208, 202, 196)
+
+TAGLINE = "every repo · what you'd lose · ranked by regret"
+
+DEFAULT_ROOTS = ["/Volumes/Storage", "/Volumes/applebottom"]
+
+# Directories that never contain work worth salvaging, and would
+# otherwise dominate the walk.
+SKIP_DIRS = {
+    "node_modules", ".venv", "venv", "__pycache__", ".next", "dist",
+    "build", "target", ".cache", "Library", ".Trash", "vendor",
+    ".terraform", "Pods", ".gradle", ".pnpm-store", ".bun",
+}
+
+MAX_DEPTH = 5
+
+
+# ---------------------------------------------------------------- discovery
+
+def find_repos(roots, progress=None):
+    """Walk roots for .git directories. Does not descend into a repo's
+    own .git, but does find nested repos (submodules, vendored clones)."""
+    repos = []
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        base_depth = root.rstrip("/").count(os.sep)
+        for dirpath, dirnames, _ in os.walk(root, onerror=lambda e: None):
+            if dirpath.count(os.sep) - base_depth >= MAX_DEPTH:
+                dirnames[:] = []
+                continue
+            dirnames[:] = [d for d in dirnames
+                           if d not in SKIP_DIRS and not d.startswith(".git")]
+            gitpath = os.path.join(dirpath, ".git")
+            if os.path.exists(gitpath):
+                repos.append(dirpath)
+                if progress and len(repos) % 25 == 0:
+                    progress(f"found {len(repos):,} repos · {tilde(dirpath)}")
+    return repos
+
+
+# ---------------------------------------------------------------- inspection
+
+def inspect(path):
+    """Collect the at-risk state of one repo. Read-only git commands only.
+
+    Returns a dict, or None if this isn't a usable repo."""
+    def git(*args, timeout=15):
+        return run(["git", "-C", path] + list(args), timeout=timeout).strip()
+
+    head = git("rev-parse", "--abbrev-ref", "HEAD")
+    if not head:
+        return None  # not a repo, or too broken to read
+
+    # Uncommitted work, split so we can distinguish "staged and about to
+    # be committed" from "untracked and easy to delete by accident".
+    dirty = staged = untracked = 0
+    for line in run(["git", "-C", path, "status", "--porcelain",
+                     "--untracked-files=normal"], timeout=20).splitlines():
+        if not line:
+            continue
+        x, y = line[0], line[1]
+        if x == "?" and y == "?":
+            untracked += 1
+        else:
+            if x != " ":
+                staged += 1
+            if y != " ":
+                dirty += 1
+
+    stashes = len([l for l in git("stash", "list").splitlines() if l])
+
+    # Unpushed commits, and branches with no upstream at all. The second
+    # case is the dangerous one: git will not warn you about it.
+    unpushed = 0
+    no_upstream = []
+    branch_out = run(["git", "-C", path, "for-each-ref",
+                      "--format=%(refname:short)\t%(upstream:short)",
+                      "refs/heads"], timeout=20)
+    for line in branch_out.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        branch = parts[0]
+        upstream = parts[1] if len(parts) > 1 else ""
+        if not upstream:
+            # Count commits not reachable from any remote ref.
+            cnt = git("rev-list", "--count", branch, "--not", "--remotes")
+            n = int(cnt) if cnt.isdigit() else 0
+            if n:
+                no_upstream.append((branch, n))
+        else:
+            cnt = git("rev-list", "--count", f"{upstream}..{branch}")
+            if cnt.isdigit():
+                unpushed += int(cnt)
+
+    has_remote = bool(git("remote"))
+
+    # Age of the most recent commit: a dirty repo untouched for a year is
+    # a different problem from one you were editing this morning.
+    last = git("log", "-1", "--format=%ct")
+    last_commit = int(last) if last.isdigit() else 0
+
+    orphan_commits = sum(n for _, n in no_upstream)
+
+    return {
+        "path": path,
+        "branch": head,
+        "dirty": dirty,
+        "staged": staged,
+        "untracked": untracked,
+        "stashes": stashes,
+        "unpushed": unpushed,
+        "no_upstream": no_upstream,
+        "orphan_commits": orphan_commits,
+        "has_remote": has_remote,
+        "last_commit": last_commit,
+    }
+
+
+def risk_score(r):
+    """Rank by how much would be unrecoverable, not by volume of change.
+
+    The weights encode a single judgement: work that exists in exactly one
+    place scores highest. Uncommitted edits and commits on branches with
+    no upstream are unrecoverable if the disk dies. Pushed commits are
+    already safe elsewhere and score nothing."""
+    score = 0.0
+    score += r["dirty"] * 3.0          # edited, never committed
+    score += r["staged"] * 3.0         # staged, never committed
+    score += r["untracked"] * 2.0      # new files, easiest to lose
+    score += r["stashes"] * 12.0       # invisible; people forget these
+    score += r["orphan_commits"] * 10.0  # committed, on no remote at all
+    score += r["unpushed"] * 6.0       # committed, remote exists but behind
+    if not r["has_remote"] and (r["dirty"] or r["untracked"] or
+                                r["orphan_commits"]):
+        score *= 1.6                   # nowhere to push even if you tried
+    return score
+
+
+def at_risk(r):
+    return bool(r["dirty"] or r["staged"] or r["untracked"] or r["stashes"]
+                or r["unpushed"] or r["orphan_commits"])
+
+
+# ---------------------------------------------------------------- rendering
+
+def risk_band(score):
+    if score >= 100:
+        return C.bad("CRITICAL")
+    if score >= 40:
+        return C.warn("HIGH    ")
+    if score >= 12:
+        return C.key("MEDIUM  ")
+    return C.dim("LOW     ")
+
+
+def describe(r):
+    """Human phrase for what is actually at risk here."""
+    bits = []
+    if r["dirty"] or r["staged"]:
+        n = r["dirty"] + r["staged"]
+        bits.append(f"{n} uncommitted")
+    if r["untracked"]:
+        bits.append(f'{r["untracked"]} untracked')
+    if r["stashes"]:
+        bits.append(f'{r["stashes"]} stash' +
+                    ("es" if r["stashes"] > 1 else ""))
+    if r["orphan_commits"]:
+        bits.append(f'{r["orphan_commits"]} commits on no remote')
+    if r["unpushed"]:
+        bits.append(f'{r["unpushed"]} unpushed')
+    if not r["has_remote"]:
+        bits.append("no remote configured")
+    return " · ".join(bits) or "clean"
+
+
+def render(results, show_all, brief):
+    w = term_width()
+    inner = w - 6
+    now = time.time()
+    risky = [r for r in results if at_risk(r)]
+    risky.sort(key=lambda r: -r["_score"])
+    shown = risky if not show_all else sorted(
+        results, key=lambda r: -r["_score"])
+
+    lines = []
+    if not shown:
+        lines.append(C.ok("  nothing at risk — every repo is committed "
+                          "and pushed"))
+    for r in shown:
+        age = human_age(now - r["last_commit"]) if r["last_commit"] else "?"
+        head = (risk_band(r["_score"]) + "  " + C.body(tilde(r["path"])))
+        lines.append(head)
+        if not brief:
+            lines.append(C.dim(f'     {r["branch"]} · {describe(r)} '
+                               f'· last commit {age} ago'))
+            for br, n in r["no_upstream"][:3]:
+                lines.append(C.warn(f"     ! branch '{br}' has {n} commits "
+                                    f"and no upstream"))
+    return frame(lines, title="salvager · unsaved work",
+                 footer=f"{len(risky)} at risk of {len(results)} repos",
+                 width=w), risky
+
+
+# ---------------------------------------------------------------- GLM triage
+
+TRIAGE_SYSTEM = """You are SALVAGE-TRIAGE. You are shown a list of git \
+repositories with unsaved work on one machine.
+
+Your job is to tell the user what to rescue FIRST and why, in a way that \
+respects what is actually unrecoverable versus merely untidy.
+
+Rules:
+- Work that exists in exactly one place outranks work that is merely \
+uncommitted but pushed elsewhere.
+- Stashes and commits on branches with no upstream are the classic silent \
+losses. Call them out explicitly.
+- A repo with no remote configured cannot be rescued by pushing. Say so, \
+and suggest what would actually help.
+- Be concrete. Name the repo paths. Suggest the specific command.
+- Do not invent repos or numbers. Use only what you are given.
+- Be brief. At most 8 short bullets, then one closing line.
+"""
+
+
+def triage(results, cfg):
+    risky = sorted([r for r in results if at_risk(r)],
+                   key=lambda r: -r["_score"])[:25]
+    if not risky:
+        return "Nothing at risk. Everything is committed and pushed.", {}
+    now = time.time()
+    rows = []
+    for r in risky:
+        rows.append(
+            f'{tilde(r["path"])} [{r["branch"]}] {describe(r)} '
+            f'· last commit {human_age(now - r["last_commit"])} ago '
+            f'· risk {r["_score"]:.0f}')
+    user = ("Repositories with unsaved work, already ranked by a local "
+            "risk score:\n\n" + "\n".join(rows) +
+            "\n\nWhat should I rescue first, and what exactly should I run?")
+    text, _, usage = call_glm(
+        cfg,
+        [{"role": "system", "content": TRIAGE_SYSTEM},
+         {"role": "user", "content": user}],
+        temperature=0.2, max_tokens=1200, label="triaging")
+    return text.strip(), usage
+
+
+# ---------------------------------------------------------------- scanning
+
+def scan(roots, workers=16):
+    live = sys.stderr.isatty()
+
+    def progress(msg):
+        if live:
+            sys.stderr.write("\r  ◈ " + msg[:70].ljust(72))
+            sys.stderr.flush()
+
+    progress("locating repositories…")
+    repos = find_repos(roots, progress)
+    results = []
+    done = 0
+    # git calls are IO-bound and independent; 1,100 repos serially is
+    # minutes, in parallel it is seconds.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(inspect, p): p for p in repos}
+        for fut in concurrent.futures.as_completed(futs):
+            done += 1
+            if live and done % 10 == 0:
+                progress(f"inspecting {done:,}/{len(repos):,} repos")
+            try:
+                r = fut.result()
+            except Exception:
+                r = None
+            if r:
+                r["_score"] = risk_score(r)
+                results.append(r)
+    if live:
+        sys.stderr.write("\r" + " " * 78 + "\r")
+    return results
+
+
+# ---------------------------------------------------------------- views
+
+def view_help():
+    w = term_width()
+    inner = w - 6
+    print()
+    print(hero_block(HERO, TAGLINE, RAMP, w))
+    print()
+    lines = [
+        C.key("salvager") + C.dim("                  scan and rank unsaved work"),
+        C.key("salvager --all") + C.dim("            include clean repos"),
+        C.key("salvager --brief") + C.dim("          one line per repo"),
+        C.key("salvager explain") + C.dim("          GLM triages the riskiest"),
+        C.key("salvager --roots A:B") + C.dim("      scan specific roots"),
+        C.key("salvager --json") + C.dim("           machine-readable output"),
+        "",
+        C.dim("Read-only. Runs no git command that writes — never commits,"),
+        C.dim("pushes, stashes or checks out anything on your behalf."),
+        "",
+        C.dim("Default roots: ") + C.body(":".join(DEFAULT_ROOTS)),
+        C.dim("             + every user home on this machine"),
+    ]
+    print(frame(lines, title="salvager · usage", width=w))
+    print()
+    return 0
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("command", nargs="?", default="scan")
+    ap.add_argument("--all", action="store_true")
+    ap.add_argument("--brief", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--roots", default="")
+    ap.add_argument("--workers", type=int, default=16)
+    ap.add_argument("-h", "--help", action="store_true")
+    args = ap.parse_args(argv)
+
+    if args.help or args.command in ("help", "--help"):
+        return view_help()
+
+    roots = ([r for r in args.roots.split(":") if r] if args.roots
+             else DEFAULT_ROOTS + user_homes())
+
+    w = term_width()
+    if not args.json:
+        print()
+        print(hero_block(HERO, TAGLINE, RAMP, w))
+        print()
+
+    start = time.time()
+    results = scan(roots, workers=args.workers)
+
+    if args.json:
+        print(json.dumps(
+            {"scanned": len(results),
+             "at_risk": [r for r in results if at_risk(r)],
+             "took": round(time.time() - start, 1)},
+            indent=2, default=str))
+        return 0
+
+    body, risky = render(results, args.all, args.brief)
+    print(body)
+    print()
+
+    total_lost = sum(r["dirty"] + r["staged"] + r["untracked"]
+                     for r in risky)
+    total_commits = sum(r["unpushed"] + r["orphan_commits"] for r in risky)
+    inner = w - 6
+    print(frame([
+        stat_line("Scanned", f"{len(results):,} repos in "
+                  f"{time.time() - start:.0f}s", inner),
+        stat_line("At risk", f"{len(risky):,} repos", inner),
+        stat_line("Files", f"{total_lost:,} uncommitted or untracked", inner),
+        stat_line("Commits", f"{total_commits:,} existing only on this disk",
+                  inner),
+    ], title="summary", width=w))
+    print()
+
+    if args.command == "explain":
+        cfg = load_config("SALVAGER_MODEL")
+        if not cfg["api_key"]:
+            print(frame([C.warn("no API key — set QGLM_API_KEY or write "
+                                "~/.qglm.yaml")], title="explain", width=w))
+            print()
+            return 1
+        text, usage = triage(results, cfg)
+        lines = []
+        for ln in text.split("\n"):
+            lines.extend(wrap_block(ln, inner) if ln.strip() else [""])
+        print(frame(lines, title="triage · what to rescue first", width=w))
+        tot = merge_usage(usage)
+        print(telemetry_line(tot, cfg["model"]))
+        print()
+        if clipboard_copy(text):
+            print(C.ok("  ✓ triage copied to clipboard"))
+            print()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.stderr.write("\n  interrupted\n")
+        sys.exit(130)

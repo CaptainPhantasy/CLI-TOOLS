@@ -1,0 +1,845 @@
+#!/usr/bin/env python3
+"""PROMPTER — your resident prompt engineer.
+
+Describe the prompt you need; PROMPT-ENGINEER-PRIME (running on the same
+GLM-4 endpoint as qglm) engineers a production-grade prompt bundle and the
+finished system prompt lands on your clipboard, framed and ready to paste.
+
+    prompter "a prompt that summarizes legal contracts"
+    prompter                       interactive wizard
+    prompter show|info|raw|copy    inspect the meta-prompt bundle
+    prompter --help                usage
+
+Zero dependencies. macOS clipboard via pbcopy. Config shared with qglm
+(~/.qglm.yaml / QGLM_API_KEY / QGLM_ENDPOINT / QGLM_MODEL).
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import textwrap
+import time
+import urllib.error
+import urllib.request
+
+# ---------------------------------------------------------------- constants
+
+# "prompter" in TheDraw font "Boner Purple" (patorjk.com/software/taag,
+# rendered from tdf-chunk-04.tdf) — shown when the terminal is wide enough.
+HERO_WIDE = r"""
+█▀▀▀▀▀▀▀▀▄   █▀▀▀▀▀▀▀▀▄    ▄▀▀▀▀▀▀▀▄   █▀▀▀▄ ▄▀▀▀█  █▀▀▀▀▀▀▀▀▄   █▀▀▀▀▀▀▀▀▀█   ▄▀▀▀▀▀▀▀▀█  █▀▀▀▀▀▀▀▀▄
+█  ▄▄▄▄   █  █  ▄▄▄▄   █  █   ▄▄▄   █  █    ▀    █  █  ▄▄▄▄   █  █▄▄▄██▄▄▄▄█  █  █▄▄▄▄▄▄█  █  ▄▄▄▄   █
+█  █▄▄▄▀  █  █  █▄▄▄▀  █  █  █   █  █  █  █▄ ▄█  █  █  █▄▄▄▀  █     █  █      █  █▄▄▄▄▄    █  █▄▄▄▀  █
+▀        ▄   ▀        ▄   ▀  ▀   ▄  ▄  ▀  █ ▀ █  ▄  ▀        ▄      ▀  █      ▀       █    ▀        ▄
+█  █▀▀▀▀▀    █  █▀▀▀▄  █  █  █   █  █  █  █   █  █  █  █▀▀▀▀▀       █  █      █  █▀▀▀▀▀    █  █▀▀▀▄  █
+█  █         █  █   █  █  █   ▀▀▀   █  █  █   █  █  █  █            █  █      █  █▀▀▀▀▀▀█  █  █   █  █
+█▄▄█         █▄▄█   █▄▄█   ▀▄▄▄▄▄▄▄▀   █▄▄█   █▄▄█  █▄▄█            █▄▄█       ▀▄▄▄▄▄▄▄▄█  █▄▄█   █▄▄█
+""".strip("\n")
+
+# compact variant for terminals narrower than the wide hero
+HERO_COMPACT = r"""
+┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐
+│ ┌──┌ │ │ ┌──┐ │ │ ┌──┐ │ │ ┌┐ ┌┐└┐│ ┌──┌ │ └─┐ ┌──┘ │ ┌────┘ │ ┌──┐ │
+│ └──┘ │ │ └──┘ │ │ │  │ │ │ ││ ││ ││ └──┘ │   │ │    │ └───┐  │ └──┘ │
+│  ┌───┘ │ ┌─┐ ┌┘ │ │  │ │ │ │└─┘│ ││  ┌───┘   │ │    │ ┌───┘  │ ┌─┐ ┌┘
+│  │     │ │ │ │  │ └──┘ │ │ │   │ ││  │       │ │    │ └────┐ │ │ │ │
+┴──┴─────┴─┴─┴─┴──┴──────┴─┴─┴───┴─┴┴──┴───────┘ └────┴──────┴─┴─┴─┴─┴──
+""".strip("\n")
+
+# light → deep purple ramp, one shade per hero row (256-color)
+PURPLE_RAMP = (189, 183, 177, 171, 135, 129, 93)
+
+TAGLINE = "ask · engineer · paste — powered by PROMPT-ENGINEER-PRIME on GLM-4"
+
+ICLOUD_SOURCE = os.path.join(
+    os.path.expanduser("~"),
+    "Library/Mobile Documents/com~apple~CloudDocs",
+    "Floyd Docs/Research/Prompt Engineering Research",
+    "prompt-engineering-agent-prompt.json",
+)
+
+META_TARGETS = {
+    "system":   "the PROMPT-ENGINEER-PRIME meta system prompt",
+    "template": "the user-message template (with {{PLACEHOLDERS}})",
+    "params":   "recommended sampling parameters as JSON",
+    "bundle":   "the entire meta prompt-bundle JSON file",
+}
+
+FIELDS = [
+    ("task", "TASK_INPUT", "What should the prompt make the model do?",
+     None),
+    ("audience", "AUDIENCE", "Who reads or acts on the output?",
+     "general technical audience"),
+    ("sources", "SOURCES", "Approved documents/data/tools (Enter = none)",
+     "none — no grounding sources; design without a grounding layer"),
+    ("constraints", "CONSTRAINTS",
+     "Hard rules, banned topics, compliance limits (Enter = none)",
+     "none beyond standard professional and safety norms"),
+    ("output_shape", "OUTPUT_SHAPE",
+     "Desired output structure (Enter = engineer's choice)",
+     "engineer's choice — recommend the best-fit structure and justify it"),
+]
+
+HISTORY_DIR = os.path.join(os.path.expanduser("~"), ".prompter", "bundles")
+
+# ---------------------------------------------------------------- color
+
+def _tty() -> bool:
+    return sys.stdout.isatty() and "NO_COLOR" not in os.environ
+
+
+class C:
+    on = _tty()
+
+    @classmethod
+    def _c(cls, code: str, s: str) -> str:
+        return f"\033[{code}m{s}\033[0m" if cls.on else s
+
+    @classmethod
+    def frame(cls, s):  return cls._c("38;5;39", s)     # bright blue
+    @classmethod
+    def hero(cls, s):   return cls._c("1;38;5;135", s)  # bold purple
+    @classmethod
+    def title(cls, s):  return cls._c("1;38;5;15", s)   # bold white
+    @classmethod
+    def dim(cls, s):    return cls._c("38;5;245", s)    # grey
+    @classmethod
+    def key(cls, s):    return cls._c("38;5;114", s)    # green
+    @classmethod
+    def ok(cls, s):     return cls._c("1;38;5;114", s)  # bold green
+    @classmethod
+    def warn(cls, s):   return cls._c("1;38;5;214", s)  # orange
+    @classmethod
+    def body(cls, s):   return cls._c("38;5;252", s)    # near-white
+    @classmethod
+    def purple(cls, s): return cls._c("38;5;141", s)    # soft purple
+
+
+ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def visible_len(s: str) -> int:
+    return len(ANSI_RE.sub("", s))
+
+
+def clip_ansi(s: str, maxlen: int) -> str:
+    """Truncate to maxlen visible chars, preserving ANSI codes."""
+    if visible_len(s) <= maxlen:
+        return s
+    out, count, i = [], 0, 0
+    while i < len(s) and count < maxlen:
+        m = ANSI_RE.match(s, i)
+        if m:
+            out.append(m.group(0))
+            i = m.end()
+        else:
+            out.append(s[i])
+            count += 1
+            i += 1
+    out.append("\033[0m" if C.on else "")
+    return "".join(out)
+
+
+# ---------------------------------------------------------------- framing
+
+def term_width() -> int:
+    cols = shutil.get_terminal_size(fallback=(100, 24)).columns
+    return max(74, min(cols, 100))
+
+
+def frame(lines, title=None, footer=None, width=None, pad=2):
+    """Render lines inside a rounded box. Lines may carry ANSI color."""
+    w = width or term_width()
+    inner = w - 2 - 2 * pad
+    out = []
+
+    if title:
+        out.append(C.frame("╭──") + C.title(f" {title} ") +
+                   C.frame("─" * max(0, w - 6 - len(title)) + "╮"))
+    else:
+        out.append(C.frame("╭" + "─" * (w - 2) + "╮"))
+
+    for ln in lines:
+        ln = clip_ansi(ln, inner)
+        gap = inner - visible_len(ln)
+        out.append(C.frame("│") + " " * pad + ln + " " * max(0, gap) +
+                   " " * pad + C.frame("│"))
+
+    if footer:
+        out.append(C.frame("╰" + "─" * max(0, w - 6 - len(footer))) +
+                   C.dim(f" {footer} ") + C.frame("──╯"))
+    else:
+        out.append(C.frame("╰" + "─" * (w - 2) + "╯"))
+    return "\n".join(out)
+
+
+def wrap_block(text: str, width: int):
+    """Wrap multi-line text to width, preserving blank lines and indent."""
+    lines = []
+    for raw in text.split("\n"):
+        if not raw.strip():
+            lines.append("")
+            continue
+        indent = " " * (len(raw) - len(raw.lstrip()))
+        wrapped = textwrap.wrap(
+            raw.strip(), width=max(10, width - len(indent)),
+            break_long_words=False, break_on_hyphens=False,
+        ) or [""]
+        lines.extend(indent + w for w in wrapped)
+    return lines
+
+
+def hero_block(width: int):
+    cols = shutil.get_terminal_size(fallback=(100, 24)).columns
+    wide_lines = HERO_WIDE.split("\n")
+    wide_w = max(len(l) for l in wide_lines)
+    if cols >= wide_w:
+        hero_w, center = wide_w, max(width, wide_w)
+        out = []
+        for i, l in enumerate(wide_lines):
+            shade = PURPLE_RAMP[min(i, len(PURPLE_RAMP) - 1)]
+            colored = (f"\033[1;38;5;{shade}m{l.rstrip()}\033[0m"
+                       if C.on else l.rstrip())
+            out.append(" " * max(0, (center - hero_w) // 2) + colored)
+    else:
+        hero_lines = HERO_COMPACT.split("\n")
+        hero_w = max(len(l) for l in hero_lines)
+        center = width
+        out = [" " * max(0, (center - hero_w) // 2) + C.hero(l.rstrip())
+               for l in hero_lines]
+    tag = TAGLINE
+    out.append(" " * max(0, (center - len(tag)) // 2) + C.dim(tag))
+    return "\n".join(out)
+
+
+def stat_line(label, value, width):
+    room = max(8, width - 14)
+    if len(value) > room:
+        value = value[: room - 1] + "…"
+    return C.key(f"{label:<14}") + C.body(value)
+
+
+# ---------------------------------------------------------------- config
+
+def load_config():
+    """Key/endpoint shared with qglm (~/.qglm.yaml); model is prompter's
+    own — glm-4.5 with thinking disabled (supports prompt caching)."""
+    cfg = {
+        "endpoint": "https://api.z.ai/api/coding/paas/v4/chat/completions",
+        "model": "glm-4.7-flash",
+        "api_key": "",
+        "timeout": 300,
+    }
+    # Per-user config wins; the machine-wide config is the fallback so
+    # every account on this host works without its own setup.
+    shared_dir = os.environ.get("QGLM_SHARED_DIR", "/usr/local/share/qglm")
+    for yaml_path in (os.path.join(os.path.expanduser("~"), ".qglm.yaml"),
+                      os.path.join(shared_dir, ".qglm.yaml")):
+        if cfg["api_key"]:
+            break
+        try:
+            with open(yaml_path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    m = re.match(r"\s*(api_key|endpoint)\s*:\s*(.+)", line)
+                    if m:
+                        cfg[m.group(1)] = m.group(2).strip().strip("'\"")
+        except OSError:
+            continue
+    cfg["api_key"] = os.environ.get("QGLM_API_KEY", cfg["api_key"])
+    cfg["endpoint"] = os.environ.get("QGLM_ENDPOINT", cfg["endpoint"])
+    cfg["model"] = os.environ.get("PROMPTER_MODEL", cfg["model"])
+    cfg["thinking"] = os.environ.get("PROMPTER_THINKING", "disabled")
+    return cfg
+
+
+# ---------------------------------------------------------------- bundle
+
+def load_bundle():
+    """Return (bundle_dict, source_path). Live iCloud copy wins; vendored
+    snapshot beside this script is the fallback."""
+    script_dir = os.path.dirname(os.path.realpath(__file__))
+    candidates = [
+        os.environ.get("PROMPTER_SOURCE"),
+        ICLOUD_SOURCE,
+        os.path.join(script_dir, "prompt-source.json"),
+    ]
+    errors = []
+    for path in candidates:
+        if not path:
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                return json.load(fh), path
+        except (OSError, json.JSONDecodeError) as exc:
+            errors.append(f"{path}: {exc}")
+    sys.stderr.write("prompter: no readable prompt source found\n")
+    for e in errors:
+        sys.stderr.write(f"  tried {e}\n")
+    sys.exit(1)
+
+
+def meta_target_text(bundle, target, source_path):
+    if target == "system":
+        return bundle["system_prompt"]
+    if target == "template":
+        return bundle["model_usage"]["user_message_template"]
+    if target == "params":
+        keys = ("temperature", "top_p", "top_k", "max_tokens",
+                "response_format")
+        params = {k: bundle["model_usage"][k]
+                  for k in keys if k in bundle["model_usage"]}
+        return json.dumps(params, indent=2)
+    if target == "bundle":
+        with open(source_path, "r", encoding="utf-8") as fh:
+            return fh.read()
+    raise KeyError(target)
+
+
+# ---------------------------------------------------------------- clipboard
+
+def clipboard_copy(text: str) -> bool:
+    try:
+        proc = subprocess.run(["pbcopy"], input=text.encode("utf-8"),
+                              timeout=10)
+        return proc.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+# ---------------------------------------------------------------- GLM call
+
+def call_glm(cfg, messages, mu):
+    """Streaming chat-completions call. Returns full response text.
+    Shows a live progress line while tokens arrive."""
+    payload = {
+        "model": cfg["model"],
+        "messages": messages,
+        "temperature": mu.get("temperature", 0.1),
+        "top_p": mu.get("top_p", 0.9),
+        # engineering-call budget: verbose models (glm-4.7-flash) blow
+        # through the bundle's 8k recommendation and truncate the JSON
+        "max_tokens": max(16000, mu.get("max_tokens", 8000)),
+        "stream": True,
+        # glm-4.5 thinking costs ~55s/call for little gain here; the
+        # param is ignored by non-thinking models like glm-4-32b
+        "thinking": {"type": cfg.get("thinking", "disabled")},
+    }
+    req = urllib.request.Request(
+        cfg["endpoint"],
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {cfg['api_key']}",
+        },
+    )
+    chunks = []
+    usage = {}
+    start = time.time()
+    last_draw = 0.0
+    spinner = "◐◓◑◒"
+    live = sys.stderr.isatty()
+    try:
+        with urllib.request.urlopen(req, timeout=cfg["timeout"]) as resp:
+            for i, raw in enumerate(resp):
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(data)
+                    delta = (obj["choices"][0]
+                             .get("delta", {}).get("content") or "")
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    continue
+                if obj.get("usage"):
+                    usage = obj["usage"]
+                if delta:
+                    chunks.append(delta)
+                now = time.time()
+                if live and now - last_draw >= 0.15:
+                    last_draw = now
+                    n = sum(len(c) for c in chunks)
+                    sys.stderr.write(
+                        f"\r  {spinner[i % 4]} engineering… "
+                        f"{n:,} chars · {now - start:.0f}s ")
+                    sys.stderr.flush()
+    finally:
+        if live:
+            sys.stderr.write("\r" + " " * 60 + "\r")
+            sys.stderr.flush()
+    return "".join(chunks), time.time() - start, usage
+
+
+def merge_usage(*usages):
+    """Sum token usage across calls into one telemetry dict."""
+    tot = {"prompt": 0, "cached": 0, "out": 0, "cache_supported": False}
+    for u in usages:
+        if not u:
+            continue
+        tot["prompt"] += u.get("prompt_tokens", 0)
+        det = u.get("prompt_tokens_details")
+        if det is not None:
+            tot["cache_supported"] = True
+            tot["cached"] += det.get("cached_tokens", 0)
+        tot["out"] += u.get("completion_tokens", 0)
+    return tot
+
+
+# $/1M tokens (input, cached input, output) — z.ai pricing 2026-07
+PRICING = {
+    "glm-4.7-flash": (0.0, 0.0, 0.0),
+    "glm-4.5-flash": (0.0, 0.0, 0.0),
+    "glm-4.7": (0.6, 0.11, 2.2),
+    "glm-4.6": (0.6, 0.11, 2.2),
+    "glm-4.5": (0.6, 0.11, 2.2),
+    "glm-4.5-air": (0.2, 0.03, 1.1),
+    "glm-4-32b-0414-128k": (0.1, None, 0.1),
+}
+
+
+def telemetry_line(tot, model=""):
+    """One-line cache/token telemetry with real z.ai pricing."""
+    if not tot["prompt"]:
+        return C.dim(" telemetry unavailable (no usage in stream)")
+    pct = 100.0 * tot["cached"] / tot["prompt"]
+    price = PRICING.get(model.lower())
+    if tot["cached"]:
+        cache_part = C.ok(f'{tot["cached"]:,} cached ({pct:.0f}%)')
+    elif tot["cache_supported"]:
+        cache_part = C.dim("0 cached (cold)")
+    else:
+        cache_part = C.dim("cache n/a for this model")
+    if price and price[0] == 0.0:
+        note = "  →  free tier ✦"
+    elif price and tot["cached"] and price[1] is not None:
+        full = tot["prompt"] * price[0] + tot["out"] * price[2]
+        real = ((tot["prompt"] - tot["cached"]) * price[0]
+                + tot["cached"] * price[1] + tot["out"] * price[2])
+        note = (f'  →  ${real / 1e6:.4f} '
+                f'(cache saved {100 * (1 - real / full):.0f}%)')
+    elif price:
+        cost = tot["prompt"] * price[0] + tot["out"] * price[2]
+        note = f'  →  ${cost / 1e6:.4f}'
+    else:
+        note = ""
+    return (C.dim(" tokens  ") + C.body(f'{tot["prompt"]:,} in') +
+            C.dim(" · ") + cache_part +
+            C.dim(" · ") + C.body(f'{tot["out"]:,} out') + C.dim(note))
+
+
+def parse_engineer_reply(text):
+    """Extract the prompt_bundle JSON from the model reply, tolerating
+    markdown fences or stray prose. Returns (bundle_or_None, cleaned)."""
+    cleaned = text.strip()
+    m = re.search(r"```(?:json)?\s*(.*?)```", cleaned, re.S)
+    if m:
+        cleaned = m.group(1).strip()
+    for candidate in (cleaned, cleaned[cleaned.find("{"):]):
+        if not candidate or not candidate.startswith("{"):
+            continue
+        try:
+            obj = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            return obj.get("prompt_bundle", obj), candidate
+    return None, text.strip()
+
+
+# ---------------------------------------------------------------- wizard
+
+def ask(label, hint, default):
+    """One framed wizard question on the tty."""
+    print(C.frame("╭──") + C.purple(f" {label} ") +
+          C.frame("─" * max(0, term_width() - 6 - len(label)) + "╮"))
+    print(C.frame("│  ") + C.dim(hint))
+    try:
+        value = input(C.frame("╰─ ") + C.key("› ")).strip()
+    except EOFError:
+        value = ""
+    print()
+    return value or default
+
+
+def gather_inputs(task_words, opts):
+    fields = {}
+    fields["task"] = " ".join(task_words).strip() or opts.get("task", "")
+    for name, _tag, hint, default in FIELDS:
+        if name == "task":
+            continue
+        fields[name] = opts.get(name) or ""
+    interactive = sys.stdin.isatty() and not opts.get("quick")
+    if not fields["task"]:
+        if not interactive:
+            sys.stderr.write("prompter: describe the prompt you need, e.g. "
+                             "prompter \"summarize legal contracts\"\n")
+            sys.exit(2)
+        fields["task"] = ask("task", FIELDS[0][2], "")
+        if not fields["task"]:
+            sys.stderr.write("prompter: a task is required\n")
+            sys.exit(2)
+    for name, _tag, hint, default in FIELDS:
+        if name == "task" or fields[name]:
+            continue
+        fields[name] = (ask(name, hint, default) if interactive else default)
+    return fields
+
+
+def build_user_message(bundle, fields):
+    template = bundle["model_usage"]["user_message_template"]
+    mapping = {
+        "TASK_INPUT": fields["task"],
+        "AUDIENCE": fields["audience"],
+        "SOURCES": fields["sources"],
+        "CONSTRAINTS": fields["constraints"],
+        "OUTPUT_SHAPE": fields["output_shape"],
+        "EXISTING_ARTIFACTS_OR_NULL": fields.get("existing") or "null",
+    }
+    for tag, value in mapping.items():
+        template = template.replace("{{" + tag + "}}", value)
+    return template
+
+
+# ---------------------------------------------------------------- views
+
+def view_engineer(argv_words, opts):
+    w = term_width()
+    inner = w - 6
+    bundle, source_path = load_bundle()
+    cfg = load_config()
+
+    if not cfg["api_key"]:
+        print(frame(
+            [C.warn(" ✘ ") + C.title("No GLM API key found"),
+             "",
+             C.body("Set one of:"),
+             C.key("  export QGLM_API_KEY=") + C.dim("\"your-key\""),
+             C.key("  api_key: ") + C.dim("… in ~/.qglm.yaml (shared "
+                                          "with qglm)")],
+            title="config"))
+        return 1
+
+    print()
+    print(hero_block(w))
+    print()
+    fields = gather_inputs(argv_words, opts)
+
+    brief = [stat_line("Task", fields["task"], inner)]
+    for name in ("audience", "sources", "constraints", "output_shape"):
+        brief.append(stat_line(name.replace("_", " ").capitalize(),
+                               fields[name], inner))
+    brief.append("")
+    brief.append(stat_line("Engine", f'{cfg["model"]}  ·  temp '
+                           f'{bundle["model_usage"]["temperature"]}', inner))
+    print(frame(brief, title="commission",
+                footer="PROMPT-ENGINEER-PRIME is on it"))
+    print()
+
+    messages = [
+        {"role": "system", "content": bundle["system_prompt"]},
+        {"role": "user", "content": build_user_message(bundle, fields)},
+    ]
+    elapsed = 0.0
+    result = cleaned = reply = None
+    usages = []
+    # small models sometimes narrate ("I will now design…") and stop
+    # before the JSON — nudge up to twice until the bundle arrives
+    for round_no in range(3):
+        try:
+            reply, took, usage = call_glm(cfg, messages,
+                                          bundle["model_usage"])
+            usages.append(usage)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:300]
+            print(frame(
+                [C.warn(" ✘ ") + C.title(f"GLM API error {exc.code}"), ""]
+                + [C.dim(l) for l in wrap_block(detail, inner)],
+                title="error"))
+            return 1
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            print(frame([C.warn(" ✘ ") + C.title("Could not reach GLM"),
+                         C.dim(str(exc))], title="error"))
+            return 1
+        elapsed += took
+        if not reply.strip():
+            print(frame([C.warn(" ✘ ") +
+                         C.title("Empty reply from the model")],
+                        title="error"))
+            return 1
+        result, cleaned = parse_engineer_reply(reply)
+        if result is not None and "system_prompt" in result:
+            break
+        low = reply.lower()
+        gate = "missing" in low and ("input" in low or "provide" in low)
+        if gate or round_no == 2:
+            break
+        messages.append({"role": "assistant", "content": reply})
+        messages.append({"role": "user", "content":
+                         "Emit the complete prompt_bundle JSON object now, "
+                         "per the output contract. Output the JSON only — "
+                         "no prose before or after it."})
+
+    if result is None or "system_prompt" not in result:
+        # input-gate failure or free-text response — show it, copy it
+        body = [C.body(l) for l in wrap_block(cleaned, inner)]
+        print(frame(body, title="engineer's response",
+                    footer=f"{cfg['model']} · {elapsed:.0f}s"))
+        copied = clipboard_copy(cleaned)
+        note = (C.ok(" ✔ ") + C.title("Response copied to clipboard")
+                if copied else
+                C.warn(" ✘ ") + C.title("Clipboard copy failed"))
+        print(frame([note, telemetry_line(merge_usage(*usages),
+                                          cfg["model"])]))
+        return 0
+
+    # ---- engineered bundle received
+    saved = save_history(result)
+    sp = result["system_prompt"]
+    samp = result.get("sampling_parameters", {})
+
+    head = [
+        stat_line("Prompt", f'{result.get("name", "unnamed")}  '
+                  f'v{result.get("version", "?")}', inner),
+        stat_line("Use", result.get("intended_use", ""), inner),
+        stat_line("Sampling", " · ".join(
+            f"{k} {samp[k]}" for k in ("preset", "temperature", "top_p",
+                                       "max_tokens") if k in samp), inner),
+        stat_line("Layers", layer_summary(result), inner),
+    ]
+    if result.get("assumptions_to_verify"):
+        head.append("")
+        head.append(C.warn("Verify before deploying:"))
+        for a in result["assumptions_to_verify"][:4]:
+            head.extend(C.dim(l) for l in wrap_block("• " + a, inner))
+    print(frame(head, title="engineered prompt",
+                footer=f"{cfg['model']} · {elapsed:.0f}s"))
+    print()
+
+    body = [C.body(l) for l in wrap_block(sp, inner)]
+    print(frame(body, title="system prompt",
+                footer=f"{len(sp):,} chars"))
+    print()
+
+    copy_target = opts.get("copy", "prompt")
+    if copy_target == "none":
+        note = C.dim(" copy skipped (--copy none)")
+    else:
+        payload = (json.dumps({"prompt_bundle": result}, indent=2)
+                   if copy_target == "json" else sp)
+        label = ("full bundle JSON" if copy_target == "json"
+                 else "system prompt")
+        if clipboard_copy(payload):
+            note = (C.ok(" ✔ ") + C.title(f"Engineered {label} copied "
+                                          "to clipboard") +
+                    C.dim("  —  paste it anywhere with ⌘V"))
+        else:
+            note = C.warn(" ✘ ") + C.title("Clipboard copy failed")
+    tail = [note]
+    if saved:
+        tail.append(C.dim(f" full bundle saved → {saved}"))
+    tail.append(C.dim(" user-message template + eval plan are in the "
+                      "saved bundle (--copy json for all of it)"))
+    tail.append(telemetry_line(merge_usage(*usages), cfg["model"]))
+    print(frame(tail, footer="prompter --help for more"))
+    print()
+    return 0
+
+
+def layer_summary(result):
+    layers = result.get("layers_satisfied", {})
+    if not layers:
+        return "not reported"
+    good = sum(1 for v in layers.values() if v)
+    return f"{good}/{len(layers)} deterministic layers satisfied"
+
+
+def save_history(result):
+    try:
+        os.makedirs(HISTORY_DIR, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        name = re.sub(r"[^a-z0-9-]", "-",
+                      str(result.get("name", "prompt")).lower())[:40]
+        path = os.path.join(HISTORY_DIR, f"{stamp}-{name}.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"prompt_bundle": result}, fh, indent=2)
+        return path.replace(os.path.expanduser("~"), "~")
+    except OSError:
+        return None
+
+
+def view_meta_show(bundle, target, source_path):
+    w = term_width()
+    text = meta_target_text(bundle, target, source_path)
+    body = [C.body(l) for l in wrap_block(text, w - 6)]
+    print()
+    print(frame(body, title=f"meta {target} · full text",
+                footer=f"{len(text):,} chars"))
+    print()
+
+
+def view_meta_copy(bundle, target, source_path):
+    text = meta_target_text(bundle, target, source_path)
+    if clipboard_copy(text):
+        line = (C.ok(" ✔ ") + C.title(f"Copied {META_TARGETS[target]} ") +
+                C.dim(f"({len(text):,} chars)"))
+        print(frame([line]))
+    else:
+        print(frame([C.warn(" ✘ ") + C.title("Clipboard copy failed")]))
+        sys.exit(1)
+
+
+def view_info(bundle, source_path):
+    w = term_width()
+    inner = w - 6
+    cfg = load_config()
+    print()
+    print(hero_block(w))
+    print()
+    lines = [
+        stat_line("Engineer", f'{bundle["name"]}  v{bundle["version"]}',
+                  inner),
+        stat_line("Engine", cfg["model"], inner),
+        stat_line("Endpoint", cfg["endpoint"], inner),
+        stat_line("API key", "configured" if cfg["api_key"] else "MISSING",
+                  inner),
+        stat_line("Meta source", source_path, inner),
+        stat_line("History", HISTORY_DIR.replace(
+            os.path.expanduser("~"), "~"), inner),
+        "",
+        C.title("Deterministic stack"),
+    ]
+    for layer in bundle["deterministic_prompt_engineering_stack"]:
+        head = f'  {layer["layer"]:<4}{layer["name"]:<16}'
+        rule = wrap_block(layer["rule"], inner - len(head))
+        lines.append(C.key(head) + C.body(rule[0] if rule else ""))
+        lines.extend(" " * len(head) + C.dim(r) for r in rule[1:])
+    print(frame(lines, title="prompter info"))
+    print()
+
+
+def view_help():
+    w = term_width()
+    inner = w - 6
+    rows = [
+        ('prompter "…what you need…"',
+         "commission a prompt; wizard fills any missing details"),
+        ("prompter", "fully interactive wizard"),
+        ("prompter -a AUD -s SRC -c CON -o SHAPE",
+         "supply audience/sources/constraints/output shape inline"),
+        ("prompter --quick \"…\"",
+         "skip the wizard; sensible defaults for unset fields"),
+        ("prompter --copy json|prompt|none",
+         "choose what lands on the clipboard (default: prompt)"),
+        ("prompter info", "engine, config, and the 11-layer stack"),
+        ("prompter show|copy|raw <t>",
+         "inspect meta bundle: system/template/params/bundle"),
+    ]
+    lines = [C.title("Usage"), ""]
+    for cmd, desc in rows:
+        parts = wrap_block(desc, max(20, inner - 40))
+        lines.append(C.key(f"  {cmd:<38}") + C.body(parts[0]))
+        lines.extend(" " * 40 + C.body(p) for p in parts[1:])
+    lines += ["", C.title("How it works"), ""]
+    lines += [C.dim(l) for l in wrap_block(
+        "Your request is sent to PROMPT-ENGINEER-PRIME (the meta prompt in "
+        "the research bundle) running on the same GLM-4 endpoint as qglm. "
+        "It returns a versioned prompt bundle: system prompt, user-message "
+        "template, output schema, few-shot examples, eval plan. The system "
+        "prompt is copied to your clipboard; the full bundle is saved under "
+        "~/.prompter/bundles/.", inner)]
+    print()
+    print(hero_block(w))
+    print()
+    print(frame(lines, title="help", footer="PROMPTER"))
+    print()
+
+
+# ---------------------------------------------------------------- main
+
+META_COMMANDS = {"show", "copy", "raw", "info", "help"}
+
+
+def parse_meta_target(args):
+    if not args:
+        return "system"
+    t = args[0].lower()
+    if t not in META_TARGETS:
+        sys.stderr.write(
+            f"prompter: unknown target '{t}' "
+            f"(expected: {', '.join(META_TARGETS)})\n")
+        sys.exit(2)
+    return t
+
+
+def parse_opts(args):
+    """Split flags from task words."""
+    opts, words, i = {}, [], 0
+    flagmap = {"-a": "audience", "--audience": "audience",
+               "-s": "sources", "--sources": "sources",
+               "-c": "constraints", "--constraints": "constraints",
+               "-o": "output_shape", "--output-shape": "output_shape",
+               "-e": "existing", "--existing": "existing",
+               "--copy": "copy"}
+    while i < len(args):
+        a = args[i]
+        if a in flagmap:
+            if i + 1 >= len(args):
+                sys.stderr.write(f"prompter: {a} needs a value\n")
+                sys.exit(2)
+            opts[flagmap[a]] = args[i + 1]
+            i += 2
+        elif a == "--quick":
+            opts["quick"] = True
+            i += 1
+        elif a == "--no-copy":
+            opts["copy"] = "none"
+            i += 1
+        else:
+            words.append(a)
+            i += 1
+    if opts.get("copy") not in (None, "prompt", "json", "none"):
+        sys.stderr.write("prompter: --copy expects prompt|json|none\n")
+        sys.exit(2)
+    return opts, words
+
+
+def main(argv):
+    if any(a in ("-h", "--help", "help") for a in argv):
+        view_help()
+        return 0
+
+    cmd = argv[0].lower() if argv else None
+    if cmd in META_COMMANDS:
+        bundle, source_path = load_bundle()
+        rest = argv[1:]
+        if cmd == "show":
+            view_meta_show(bundle, parse_meta_target(rest), source_path)
+        elif cmd == "copy":
+            view_meta_copy(bundle, parse_meta_target(rest), source_path)
+        elif cmd == "raw":
+            sys.stdout.write(meta_target_text(
+                bundle, parse_meta_target(rest), source_path))
+            if sys.stdout.isatty():
+                sys.stdout.write("\n")
+        elif cmd == "info":
+            view_info(bundle, source_path)
+        return 0
+
+    opts, words = parse_opts(argv)
+    return view_engineer(words, opts)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)
+    except BrokenPipeError:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)

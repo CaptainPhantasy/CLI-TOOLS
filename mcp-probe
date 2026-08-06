@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""mcp-probe — drive a CLITOOLS MCP Apps server over real stdio JSON-RPC.
+
+There is no substitute for speaking the actual protocol to the actual
+server: import-level tests would miss framing bugs, capability
+negotiation, and the visibility rules that are the whole point of these
+servers.
+
+    ./mcp-probe KEYRING/keyring-app
+    ./mcp-probe --no-ui SALVAGER/salvager-app     # simulate a text-only host
+    ./mcp-probe --call scan_credentials RECALLER/recaller-app
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+UI_EXT = "io.modelcontextprotocol/ui"
+UI_MIME = "text/html;profile=mcp-app"
+
+
+class Probe:
+    def __init__(self, cmd, ui=True):
+        self.p = subprocess.Popen(
+            [sys.executable, cmd], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+        self.id = 0
+        self.ui = ui
+
+    def call(self, method, params=None):
+        self.id += 1
+        msg = {"jsonrpc": "2.0", "id": self.id, "method": method,
+               "params": params or {}}
+        self.p.stdin.write(json.dumps(msg) + "\n")
+        self.p.stdin.flush()
+        line = self.p.stdout.readline()
+        if not line:
+            err = self.p.stderr.read()
+            raise RuntimeError(f"server died:\n{err}")
+        return json.loads(line)
+
+    def initialize(self):
+        caps = {}
+        if self.ui:
+            caps["extensions"] = {UI_EXT: {"mimeTypes": [UI_MIME]}}
+        return self.call("initialize", {
+            "protocolVersion": "2026-01-26",
+            "capabilities": caps,
+            "clientInfo": {"name": "mcp-probe", "version": "1.0.0"}})
+
+    def close(self):
+        try:
+            self.p.stdin.close()
+            self.p.wait(timeout=5)
+        except Exception:
+            self.p.kill()
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("server")
+    ap.add_argument("--no-ui", action="store_true",
+                    help="simulate a host without MCP Apps support")
+    ap.add_argument("--call", default="")
+    ap.add_argument("--args", default="{}")
+    ap.add_argument("--full", action="store_true")
+    a = ap.parse_args()
+
+    pr = Probe(a.server, ui=not a.no_ui)
+    ok = True
+    try:
+        init = pr.initialize()
+        info = init["result"]["serverInfo"]
+        print(f"✓ initialize   {info['name']} v{info['version']} "
+              f"(ui={'on' if not a.no_ui else 'off'})")
+
+        tools = pr.call("tools/list")["result"]["tools"]
+        print(f"✓ tools/list   {len(tools)} visible to model")
+        for t in tools:
+            ui = (t.get("_meta") or {}).get("ui") or {}
+            bits = []
+            if ui.get("resourceUri"):
+                bits.append(f"view={ui['resourceUri']}")
+            if ui.get("visibility"):
+                bits.append(f"visibility={ui['visibility']}")
+            print(f"    - {t['name']:22} {' '.join(bits)}")
+
+        res = pr.call("resources/list")["result"]["resources"]
+        print(f"✓ resources    {len(res)} ui:// resource(s)")
+        for r in res:
+            assert r["uri"].startswith("ui://"), "resource must use ui:// scheme"
+            assert r["mimeType"] == UI_MIME, f"bad mimeType {r['mimeType']}"
+            body = pr.call("resources/read", {"uri": r["uri"]})["result"]
+            html = body["contents"][0]["text"]
+            assert html.lstrip().startswith("<!DOCTYPE html>"), "must be HTML5"
+            print(f"    - {r['uri']:34} {len(html):,} bytes  "
+                  f"csp={json.dumps((r.get('_meta',{}).get('ui',{}) or {}).get('csp',{}))}")
+
+        if a.call:
+            out = pr.call("tools/call", {"name": a.call,
+                                         "arguments": json.loads(a.args)})
+            if "error" in out:
+                print(f"✗ tools/call   {a.call}: {out['error']['message']}")
+                ok = False
+            else:
+                r = out["result"]
+                text = r["content"][0]["text"]
+                sc = r.get("structuredContent")
+                print(f"✓ tools/call   {a.call}: {len(text)} chars text, "
+                      f"structured={'yes' if sc else 'no'}")
+                if a.full:
+                    print(text[:2000])
+                elif text:
+                    print("    " + text.split("\n")[0][:100])
+    except Exception as e:
+        print(f"✗ FAILED: {e}")
+        ok = False
+    finally:
+        pr.close()
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

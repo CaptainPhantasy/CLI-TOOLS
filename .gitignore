@@ -1,0 +1,58 @@
+# ---------------------------------------------------------------- secrets
+# KEYRING found a live z.ai API key in QGLM/.env. Nothing resembling a
+# credential may ever enter this history: git history is forever, and a
+# leaked key is not fixed by a later commit.
+.env
+.env.*
+*.env
+!.env.example
+.qglm.yaml
+*.pem
+*.key
+credentials.json
+auth.json
+.keyring-salt
+
+# ------------------------------------------------------------ build output
+# Compiled binaries are rebuildable from source and cost 14MB each.
+QGLM/qglm
+LGCY/dist/
+**/.build/
+**/DerivedData/
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+dist/
+build/
+target/
+
+# --------------------------------------------------------------- backups
+# Timestamped hand-rolled backups. Version control replaces these; that
+# is the entire point of creating this repo.
+*.backup
+*.backup-*
+*.backup.*
+*.bak
+*~
+
+# ------------------------------------------------------------ local state
+# Machine-specific indexes and caches, not source.
+.DS_Store
+.floyd/
+*.log
+.planning/
+*.tmp
+*.swp
+
+# ----------------------------------------------------- nested repositories
+# LGCY, QGLM and MITsh are their own git repos with their own history.
+# Tracking them here would either swallow that history or create broken
+# gitlinks. They are excluded deliberately; see README for how to restore
+# them. If they should become part of this repo, convert them properly
+# with `git submodule add` rather than by deleting these lines.
+LGCY/
+QGLM/
+MITsh/

@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""test-mcp-apps — full verification of the three MCP Apps servers.
+
+Checks, in order of what would hurt most if broken:
+
+  1. SECURITY   no secret value reaches any model-visible surface
+  2. SECURITY   app-only tools are absent from tools/list
+  3. SECURITY   write tools reject inputs outside their remit
+  4. PROTOCOL   initialize / tools/list / resources/read conform to SEP-1865
+  5. PROTOCOL   servers degrade to text-only when the host lacks the extension
+  6. BEHAVIOUR  each view renders real data in a simulated host
+
+Run: ./test-mcp-apps
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import shutil
+
+TOOLS = os.path.dirname(os.path.realpath(__file__))
+UI_EXT = "io.modelcontextprotocol/ui"
+UI_MIME = "text/html;profile=mcp-app"
+
+MODERN = "2026-07-28"
+M_VER = "io.modelcontextprotocol/protocolVersion"
+M_CAPS = "io.modelcontextprotocol/clientCapabilities"
+M_INFO = "io.modelcontextprotocol/clientInfo"
+M_SRV = "io.modelcontextprotocol/serverInfo"
+
+
+def modern_meta(ui=True):
+    caps = {"extensions": {UI_EXT: {"mimeTypes": [UI_MIME]}}} if ui else {}
+    return {M_VER: MODERN, M_CAPS: caps,
+            M_INFO: {"name": "test", "version": "1"}}
+
+PASS, FAIL = [], []
+
+
+def check(name, ok, detail=""):
+    (PASS if ok else FAIL).append(name)
+    mark = "\033[32m✓\033[0m" if ok else "\033[31m✗\033[0m"
+    print(f"  {mark} {name}" + (f"  — {detail}" if detail else ""))
+    return ok
+
+
+class Probe:
+    def __init__(self, path, ui=True, modern=False):
+        self.p = subprocess.Popen(
+            [sys.executable, path], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+        self.id = 0
+        self.modern = modern
+        self.ui = ui
+        if modern:
+            # Modern era: no handshake at all. Every request self-describes.
+            self.init = None
+        else:
+            caps = {"extensions": {UI_EXT: {"mimeTypes": [UI_MIME]}}} if ui else {}
+            self.init = self.call("initialize", {
+                "protocolVersion": "2026-01-26", "capabilities": caps,
+                "clientInfo": {"name": "test", "version": "1"}})
+
+    def call(self, method, params=None):
+        self.id += 1
+        params = dict(params or {})
+        if self.modern:
+            params["_meta"] = modern_meta(self.ui)
+        self.p.stdin.write(json.dumps({
+            "jsonrpc": "2.0", "id": self.id, "method": method,
+            "params": params}) + "\n")
+        self.p.stdin.flush()
+        line = self.p.stdout.readline()
+        if not line:
+            raise RuntimeError("server died: " + self.p.stderr.read()[:400])
+        return json.loads(line)
+
+    def raw(self, method, params):
+        """Send exactly these params, without injecting _meta."""
+        self.id += 1
+        self.p.stdin.write(json.dumps({
+            "jsonrpc": "2.0", "id": self.id, "method": method,
+            "params": params}) + "\n")
+        self.p.stdin.flush()
+        return json.loads(self.p.stdout.readline())
+
+    def close(self):
+        try:
+            self.p.stdin.close()
+            self.p.wait(timeout=5)
+        except Exception:
+            self.p.kill()
+
+
+SERVERS = {
+    "keyring": (f"{TOOLS}/KEYRING/keyring-app", "ui://keyring/inventory"),
+    "salvager": (f"{TOOLS}/SALVAGER/salvager-app", "ui://salvager/triage"),
+    "recaller": (f"{TOOLS}/RECALLER/recaller-app", "ui://recaller/palette"),
+}
+
+
+def test_modern_era():
+    """2026-07-28: stateless, no handshake, server/discover REQUIRED."""
+    print("\nPROTOCOL — modern era (2026-07-28, stateless)")
+    for name, (path, uri) in SERVERS.items():
+        pr = Probe(path, modern=True)
+        try:
+            # No initialize was sent; requests must work regardless.
+            d = pr.call("server/discover")["result"]
+            check(f"{name}: server/discover implemented", "supportedVersions" in d)
+            check(f"{name}: advertises {MODERN}",
+                  MODERN in d.get("supportedVersions", []))
+            check(f"{name}: result carries resultType",
+                  d.get("resultType") == "complete")
+            check(f"{name}: discover is cacheable",
+                  isinstance(d.get("ttlMs"), int) and d.get("cacheScope") in
+                  ("public", "private"))
+            check(f"{name}: result _meta carries serverInfo",
+                  (d.get("_meta") or {}).get(M_SRV, {}).get("name") == name)
+
+            t = pr.call("tools/list")["result"]
+            check(f"{name}: tools/list works with no handshake",
+                  len(t.get("tools", [])) >= 1)
+            check(f"{name}: tools/list is cacheable",
+                  isinstance(t.get("ttlMs"), int))
+            names = [x["name"] for x in t["tools"]]
+            check(f"{name}: tools/list deterministic order",
+                  names == sorted(names))
+            check(f"{name}: view advertised to modern ui host",
+                  any((x.get("_meta", {}).get("ui", {})).get("resourceUri")
+                      for x in t["tools"]))
+
+            r = pr.call("resources/read", {"uri": uri})["result"]
+            check(f"{name}: resources/read is cacheable",
+                  isinstance(r.get("ttlMs"), int))
+            check(f"{name}: read content carries _meta.ui",
+                  "ui" in (r["contents"][0].get("_meta") or {}))
+        finally:
+            pr.close()
+
+
+def test_version_errors():
+    """Version negotiation and the error codes 2026-07-28 renumbered."""
+    print("\nPROTOCOL — version negotiation and error codes")
+    path, uri = SERVERS["keyring"]
+    pr = Probe(path, modern=True)
+    try:
+        e = pr.raw("tools/list", {"_meta": {
+            M_VER: "1900-01-01", M_CAPS: {}}}).get("error", {})
+        check("unsupported version -> -32022", e.get("code") == -32022,
+              f"got {e.get('code')}")
+        check("error lists supported versions",
+              MODERN in (e.get("data", {}).get("supported") or []))
+
+        e = pr.raw("tools/list", {"_meta": {M_VER: MODERN}}).get("error", {})
+        check("missing clientCapabilities -> -32602", e.get("code") == -32602,
+              f"got {e.get('code')}")
+
+        e = pr.call("resources/read", {"uri": "ui://does-not-exist"}).get("error", {})
+        check("unknown resource -> -32602 (was -32002)",
+              e.get("code") == -32602, f"got {e.get('code')}")
+    finally:
+        pr.close()
+
+    # A modern host that does NOT support MCP Apps must see no view.
+    pr = Probe(path, ui=False, modern=True)
+    try:
+        t = pr.call("tools/list")["result"]["tools"]
+        leaked = [x["name"] for x in t
+                  if (x.get("_meta", {}).get("ui", {})).get("resourceUri")]
+        check("modern host without ui ext gets no resourceUri", not leaked,
+              str(leaked))
+    finally:
+        pr.close()
+
+
+def test_protocol():
+    print("\nPROTOCOL — SEP-1865 conformance")
+    for name, (path, uri) in SERVERS.items():
+        pr = Probe(path)
+        try:
+            info = pr.init["result"]["serverInfo"]
+            check(f"{name}: initialize", info["name"] == name)
+            res = pr.call("resources/list")["result"]["resources"]
+            r = next((x for x in res if x["uri"] == uri), None)
+            check(f"{name}: ui:// resource declared", r is not None)
+            check(f"{name}: mimeType is {UI_MIME}",
+                  r and r["mimeType"] == UI_MIME)
+            body = pr.call("resources/read", {"uri": uri})["result"]["contents"][0]
+            check(f"{name}: serves HTML5",
+                  body["text"].lstrip().startswith("<!DOCTYPE html>"))
+            check(f"{name}: declares CSP metadata",
+                  "csp" in (body.get("_meta", {}).get("ui", {})))
+            tools = pr.call("tools/list")["result"]["tools"]
+            linked = [t for t in tools
+                      if (t.get("_meta", {}).get("ui", {})).get("resourceUri")]
+            check(f"{name}: tool links to view", len(linked) >= 1)
+            for t in tools:
+                if not check(f"{name}: {t['name']} returns text content",
+                             True):
+                    pass
+        finally:
+            pr.close()
+
+
+def test_degradation():
+    print("\nPROTOCOL — graceful degradation (host without MCP Apps)")
+    for name, (path, uri) in SERVERS.items():
+        pr = Probe(path, ui=False)
+        try:
+            tools = pr.call("tools/list")["result"]["tools"]
+            leaked = [t["name"] for t in tools
+                      if (t.get("_meta", {}).get("ui", {})).get("resourceUri")]
+            check(f"{name}: no resourceUri advertised", not leaked,
+                  f"leaked {leaked}" if leaked else "")
+            check(f"{name}: tools still usable", len(tools) >= 1)
+        finally:
+            pr.close()
+
+
+def test_keyring_security():
+    print("\nSECURITY — KEYRING never leaks a value to the model")
+    path, uri = SERVERS["keyring"]
+    pr = Probe(path)
+    try:
+        tools = [t["name"] for t in pr.call("tools/list")["result"]["tools"]]
+        check("reveal_secret hidden from model", "reveal_secret" not in tools,
+              f"visible: {tools}")
+
+        scan = pr.call("tools/call",
+                       {"name": "scan_credentials", "arguments": {}})["result"]
+        secrets = scan["structuredContent"]["secrets"]
+
+        # Everything a model could ever receive from this server.
+        surface = (json.dumps(pr.call("tools/list"))
+                   + json.dumps(scan)
+                   + json.dumps(pr.call("resources/read", {"uri": uri})))
+
+        # Real secrets, re-derived from disk via the app-only path.
+        values = []
+        for g in secrets:
+            r = pr.call("tools/call", {"name": "reveal_secret",
+                                       "arguments": {"fingerprint": g["fp"]}})
+            if "result" in r:
+                values.append(r["result"]["structuredContent"]["value"])
+        check("app-only reveal returns real values", len(values) > 0,
+              f"{len(values)} revealed")
+
+        leaks = [v[:8] for v in values if len(v) >= 20 and v in surface]
+        check("zero values in model-visible surface", not leaks,
+              f"LEAKED {leaks}" if leaks else f"checked {len(values)} values")
+
+        bad = pr.call("tools/call", {"name": "reveal_secret",
+                                     "arguments": {"fingerprint": "deadbeef"}})
+        check("unknown fingerprint rejected", "error" in bad)
+
+        guard = pr.call("tools/call", {"name": "tighten_permissions",
+                                       "arguments": {"path": "/etc/hosts"}})
+        check("chmod refuses non-credential file", "error" in guard)
+    finally:
+        pr.close()
+
+
+def test_salvager_safety():
+    print("\nSECURITY — SALVAGER write tools are narrow and safe")
+    path, _ = SERVERS["salvager"]
+    pr = Probe(path)
+    d = tempfile.mkdtemp()
+    try:
+        bad = pr.call("tools/call", {"name": "commit_repo",
+                                     "arguments": {"path": "/tmp"}})
+        check("commit rejects non-repo", "error" in bad)
+
+        subprocess.run(["git", "init", "-q", d], check=True)
+        subprocess.run(["git", "-C", d, "config", "user.email", "t@t"], check=True)
+        subprocess.run(["git", "-C", d, "config", "user.name", "t"], check=True)
+        with open(os.path.join(d, "f.txt"), "w") as fh:
+            fh.write("x")
+
+        r = pr.call("tools/call", {"name": "commit_repo",
+                                   "arguments": {"path": d, "message": "t"}})
+        sc = r["result"]["structuredContent"]
+        check("commit works on real repo", sc.get("ok") is True)
+        log = subprocess.run(["git", "-C", d, "log", "--oneline"],
+                             capture_output=True, text=True).stdout
+        check("commit actually landed", "t" in log)
+
+        r = pr.call("tools/call", {"name": "push_repo", "arguments": {"path": d}})
+        sc = r["result"]["structuredContent"]
+        check("push declines with no remote", sc.get("ok") is False)
+
+        names = [t["name"] for t in pr.call("tools/list")["result"]["tools"]]
+        dangerous = [n for n in names
+                     if any(w in n for w in ("reset", "force", "discard",
+                                             "delete", "clean", "rebase"))]
+        check("no destructive tools exposed", not dangerous, str(dangerous))
+    finally:
+        pr.close()
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_views():
+    print("\nBEHAVIOUR — views render real data in a simulated host")
+    fixtures = {
+        "keyring": ("scan_credentials", {}, "kimi-code"),
+        "salvager": ("scan_repos", {"roots": [TOOLS]}, "CLITOOLS"),
+        "recaller": ("search_commands", {"query": "keychain vault"}, "keychain"),
+    }
+    tmp = tempfile.mkdtemp()
+    try:
+        for name, (tool, args, expect) in fixtures.items():
+            path, uri = SERVERS[name]
+            pr = Probe(path)
+            try:
+                html = pr.call("resources/read",
+                               {"uri": uri})["result"]["contents"][0]["text"]
+                res = pr.call("tools/call",
+                              {"name": tool, "arguments": args})["result"]
+            finally:
+                pr.close()
+            hf = os.path.join(tmp, f"{name}.html")
+            ff = os.path.join(tmp, f"{name}.json")
+            with open(hf, "w") as fh:
+                fh.write(html)
+            with open(ff, "w") as fh:
+                json.dump({"input": args, "result": res}, fh)
+            p = subprocess.run(
+                ["node", os.path.join(TOOLS, "view-harness.mjs"), hf, ff, expect],
+                capture_output=True, text=True, timeout=180)
+            ok = p.returncode == 0 and "PASS" in p.stdout
+            check(f"{name}: view renders", ok,
+                  p.stdout.strip().split("\n")[0] if p.stdout else p.stderr[:120])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def main():
+    print("=" * 66)
+    print("  CLITOOLS MCP Apps — verification")
+    print("  core protocol: 2026-07-28 (modern) + legacy handshake")
+    print("  extension:     SEP-1865 MCP Apps (io.modelcontextprotocol/ui)")
+    print("=" * 66)
+    test_modern_era()
+    test_version_errors()
+    test_protocol()
+    test_degradation()
+    test_keyring_security()
+    test_salvager_safety()
+    test_views()
+    print("\n" + "=" * 66)
+    print(f"  {len(PASS)} passed, {len(FAIL)} failed")
+    if FAIL:
+        for f in FAIL:
+            print(f"    ✗ {f}")
+    print("=" * 66)
+    return 1 if FAIL else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""recaller-app — MCP Apps server for RECALLER (SEP-1865).
+
+Why this exists
+---------------
+2,337 indexed commands is well past the point where a ranked text list is
+the right interface. The CLI needed IDF weighting and cross-session dedupe
+just to make its top ten tolerable, which is a sign the interface, not the
+ranking, is the bottleneck.
+
+As an app it becomes a command palette: type, filter live, see at a glance
+which commands actually exited 0, and click to copy or to hand one to the
+model. Search runs server-side against the existing index, so the view
+stays small and the ranking logic stays in one place.
+
+Safety posture
+--------------
+Read-only with respect to your transcripts and your system: this server
+never executes a recovered command. `use_command` hands the text to the
+model via the app, and running it remains a separate, deliberate act with
+whatever approval your host already enforces. Recovering a command and
+running it are different decisions, and conflating them is how you rerun
+an `rm -rf` from six months ago.
+"""
+
+import importlib.machinery
+import importlib.util
+import os
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(HERE), "lib"))
+
+from mcpkit import Server, JsonRpcError, log  # noqa: E402
+from uikit import page  # noqa: E402
+
+_spec = importlib.util.spec_from_loader(
+    "recaller_cli",
+    importlib.machinery.SourceFileLoader("recaller_cli",
+                                         os.path.join(HERE, "recaller")))
+recaller_cli = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(recaller_cli)
+
+VIEW_URI = "ui://recaller/palette"
+
+VIEW_CSS = """
+.search { margin-bottom:10px; }
+.hit { padding:8px 10px; border:1px solid var(--color-border-primary);
+       border-radius:var(--border-radius-md); margin-bottom:5px; cursor:pointer; }
+.hit:hover { background:var(--color-background-secondary); }
+.hit.on { border-color:var(--color-text-primary);
+          background:var(--color-background-secondary); }
+.cmd { font-family:var(--font-mono); font-size:12px; white-space:pre-wrap;
+       word-break:break-word; }
+.cmd.clip { display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical;
+            overflow:hidden; }
+.meta { font-size:11px; color:var(--color-text-secondary); margin-top:3px;
+        display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+.prompt { font-size:11px; color:var(--color-text-tertiary); margin-top:2px;
+          font-style:italic; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.acts { display:flex; gap:6px; margin-top:7px; }
+.mark { font-weight:700; }
+.mark.ok { color:var(--color-text-success); }
+.mark.bad { color:var(--color-text-danger); }
+.bar { display:flex; gap:6px; align-items:center; margin-bottom:8px; flex-wrap:wrap; }
+.spacer { flex:1; }
+.filters button.on { background:var(--color-text-primary);
+                     color:var(--color-background-primary); border-color:transparent; }
+.toast { position:sticky; bottom:0; padding:6px 10px; font-size:12px;
+         color:var(--color-text-success); }
+"""
+
+VIEW_BODY = """
+<div class="hdr">
+  <h1>Command recall</h1>
+  <span class="muted tiny" id="stats"></span>
+</div>
+<div class="search">
+  <input type="search" id="q" placeholder="what were you trying to do?" autofocus>
+</div>
+<div class="bar filters">
+  <button data-f="all" class="on">All</button>
+  <button data-f="ok">Worked only</button>
+  <div class="spacer"></div>
+  <span class="muted tiny" id="count"></span>
+</div>
+<div id="list" class="empty">type to search 2,000+ recovered commands</div>
+<div class="toast" id="toast"></div>
+"""
+
+VIEW_JS = r"""
+let HITS = [], SELECTED = -1, FILTER = 'all', TIMER = null;
+
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function shown() {
+  return FILTER === 'ok' ? HITS.filter(h => h.ok) : HITS;
+}
+
+function render() {
+  const list = document.getElementById('list');
+  const hs = shown();
+  document.getElementById('count').textContent =
+    hs.length ? hs.length + ' matches' : '';
+  if (!hs.length) {
+    list.className = 'empty';
+    list.textContent = document.getElementById('q').value
+      ? 'no matches — try fewer or rarer words' : 'type to search';
+    return;
+  }
+  list.className = '';
+  list.innerHTML = hs.map((h, i) => {
+    const mark = h.ok ? '<span class="mark ok">✓</span>'
+      : h.failed ? '<span class="mark bad">✗</span>' : '<span class="muted">·</span>';
+    const sel = i === SELECTED;
+    return `
+      <div class="hit ${sel ? 'on' : ''}" data-i="${i}">
+        <div class="row">${mark}<div class="cmd ${sel ? '' : 'clip'}">${esc(h.cmd)}</div></div>
+        <div class="meta">
+          <span>${esc(h.harness)}</span>
+          <span>${esc(h.age)} ago</span>
+          <span class="mono">${esc(h.cwd || '')}</span>
+        </div>
+        ${h.prompt ? `<div class="prompt">“${esc(h.prompt)}”</div>` : ''}
+        ${sel ? `<div class="acts">
+            <button data-copy="${i}">Copy</button>
+            <button data-use="${i}" class="primary">Send to chat</button>
+          </div>` : ''}
+      </div>`;
+  }).join('');
+}
+
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  setTimeout(() => { if (t.textContent === msg) t.textContent = ''; }, 2500);
+}
+
+document.getElementById('q').addEventListener('input', () => {
+  clearTimeout(TIMER);
+  TIMER = setTimeout(search, 180);   // debounce: search is a server round-trip
+});
+
+document.addEventListener('keydown', (e) => {
+  const hs = shown();
+  if (e.key === 'ArrowDown') { SELECTED = Math.min(SELECTED + 1, hs.length - 1); render(); e.preventDefault(); }
+  else if (e.key === 'ArrowUp') { SELECTED = Math.max(SELECTED - 1, 0); render(); e.preventDefault(); }
+  else if (e.key === 'Enter' && SELECTED >= 0) { use(hs[SELECTED]); e.preventDefault(); }
+});
+
+document.addEventListener('click', async (e) => {
+  const f = e.target.getAttribute && e.target.getAttribute('data-f');
+  if (f) {
+    FILTER = f; SELECTED = -1;
+    document.querySelectorAll('.filters button[data-f]')
+      .forEach(b => b.classList.toggle('on', b.getAttribute('data-f') === f));
+    render(); return;
+  }
+  const ci = e.target.getAttribute && e.target.getAttribute('data-copy');
+  if (ci !== null && ci !== undefined) {
+    const h = shown()[+ci];
+    try { await navigator.clipboard.writeText(h.cmd); toast('copied'); }
+    catch (err) { toast('clipboard blocked — select the text instead'); }
+    e.stopPropagation(); return;
+  }
+  const ui = e.target.getAttribute && e.target.getAttribute('data-use');
+  if (ui !== null && ui !== undefined) { use(shown()[+ui]); e.stopPropagation(); return; }
+  const card = e.target.closest && e.target.closest('[data-i]');
+  if (card) { SELECTED = +card.getAttribute('data-i'); render(); }
+});
+
+async function use(h) {
+  if (!h) return;
+  // Hand the command to the chat. Deliberately does NOT execute it.
+  await MCP.sendMessage('Recovered this command from my earlier session'
+    + (h.cwd ? ' (cwd ' + h.cwd + ')' : '') + ':\n\n```\n' + h.cmd + '\n```');
+  toast('sent to chat');
+}
+
+async function search() {
+  const q = document.getElementById('q').value.trim();
+  if (!q) { HITS = []; SELECTED = -1; render(); return; }
+  const res = await MCP.callTool('search_commands', { query: q, limit: 30 });
+  const d = structuredOf(res) || {};
+  HITS = d.hits || [];
+  SELECTED = HITS.length ? 0 : -1;
+  render();
+}
+
+(async () => {
+  await MCP.init({ name: 'recaller-view' });
+  onToolData(({ input, result }) => {
+    const d = structuredOf(result);
+    if (d && d.hits) {
+      HITS = d.hits; SELECTED = HITS.length ? 0 : -1;
+      if (input && input.query) document.getElementById('q').value = input.query;
+      render();
+    }
+    if (d && d.stats) document.getElementById('stats').textContent = d.stats;
+  });
+})();
+"""
+
+
+srv = Server(
+    "recaller",
+    instructions=(
+        "Recovers commands from your own past agent sessions across jcode, "
+        "codex and claude. Commands that exited 0 rank above ones that "
+        "errored. Never executes anything."),
+)
+
+srv.resource(
+    VIEW_URI, "Command Palette",
+    page("RECALLER", VIEW_BODY, VIEW_CSS, VIEW_JS),
+    description="Search and reuse commands recovered from past sessions.",
+    csp={},
+    prefers_border=True,
+)
+
+
+def _hit_dict(score, e, c, now):
+    return {
+        "cmd": c["cmd"],
+        "ok": bool(c.get("ok")),
+        "failed": bool(c.get("failed")),
+        "harness": e["harness"],
+        "cwd": e.get("cwd", ""),
+        "path": e["path"],
+        "age": recaller_cli.human_age(now - e["mtime"]),
+        "prompt": (e["prompts"][0][:160] if e.get("prompts") else ""),
+        "score": round(score, 2),
+    }
+
+
+@srv.tool(
+    "search_commands",
+    "Search your own past agent sessions for a command you ran before. "
+    "Describe it loosely; commands that succeeded rank above ones that "
+    "failed. Returns the commands, never runs them.",
+    {"type": "object", "properties": {
+        "query": {"type": "string", "description": "Rough description."},
+        "cmd": {"type": "string", "description": "Literal substring filter."},
+        "limit": {"type": "integer", "description": "Max hits (default 25)."}},
+     "required": ["query"]},
+    resource_uri=VIEW_URI,
+)
+def search_commands(query, cmd="", limit=25):
+    index = recaller_cli.load_index()
+    hits = recaller_cli.search(index, query, cmd, "", int(limit or 25))
+    now = time.time()
+    out = [_hit_dict(s, e, c, now) for s, e, c in hits]
+
+    if not out:
+        return (f"No matches for “{query}”. Try fewer or rarer words, or "
+                f"rebuild with `recaller index`."), {"hits": []}
+    lines = [f"{len(out)} matches for “{query}” "
+             f"(✓ = exited 0, ✗ = errored):", ""]
+    for h in out[:15]:
+        mark = "✓" if h["ok"] else ("✗" if h["failed"] else "·")
+        one = " ⏎ ".join(l.strip() for l in h["cmd"].split("\n") if l.strip())
+        lines.append(f'{mark} {one[:180]}')
+        lines.append(f'    {h["harness"]} · {h["age"]} ago · {h["cwd"] or h["path"]}')
+    return "\n".join(lines), {
+        "hits": out,
+        "stats": f'{index["commands"]:,} commands · {index["sessions"]} sessions',
+    }
+
+
+@srv.tool(
+    "recall_stats",
+    "Report what the recall index currently covers: sessions, commands, "
+    "and which harnesses they came from.",
+    {"type": "object", "properties": {}},
+)
+def recall_stats():
+    index = recaller_cli.load_index(auto_build=False)
+    if not index:
+        return ("No index yet. Run `recaller index` to scan your session "
+                "transcripts."), {"indexed": False}
+    by = {}
+    for e in index["entries"]:
+        by[e["harness"]] = by.get(e["harness"], 0) + 1
+    src = ", ".join(f"{k} {v}" for k, v in sorted(by.items(), key=lambda x: -x[1]))
+    return (f'{index["commands"]:,} commands across {index["sessions"]} '
+            f'sessions (built {index["built_at"]}). Sources: {src}.'),\
+        {"indexed": True, "commands": index["commands"],
+         "sessions": index["sessions"], "sources": by,
+         "built_at": index["built_at"]}
+
+
+@srv.tool(
+    "rebuild_index",
+    "Re-scan every session transcript on this machine and rebuild the "
+    "recall index. Takes about 20 seconds.",
+    {"type": "object", "properties": {}},
+)
+def rebuild_index():
+    start = time.time()
+    idx = recaller_cli.build_index()
+    log(f"[recaller] index rebuilt in {time.time() - start:.0f}s")
+    return (f'Indexed {idx["commands"]:,} commands from {idx["sessions"]} '
+            f'sessions ({idx["files_seen"]} transcripts) in '
+            f'{time.time() - start:.0f}s.'), {
+        "commands": idx["commands"], "sessions": idx["sessions"]}
+
+
+if __name__ == "__main__":
+    srv.serve()

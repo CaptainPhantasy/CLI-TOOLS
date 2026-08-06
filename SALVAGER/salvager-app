@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+"""salvager-app — MCP Apps server for SALVAGER (SEP-1865).
+
+Why this exists
+---------------
+The SALVAGER CLI prints a ranked list of repos with unsaved work, and then
+you go fix them by hand, one `git -C <path> ...` at a time. The output is
+already ranked and inherently multi-select, which is exactly the shape
+text is worst at.
+
+As an app it becomes a triage board: check the repos you want, commit or
+push them in one action, and `ui/update-model-context` tells the model what
+you actually did so it can follow through in the next turn.
+
+Safety posture
+--------------
+The CLI is strictly read-only. This server is not, because rescuing work
+is the point. So the write surface is deliberately narrow:
+
+  * commit_repo   — stages and commits IN ONE NAMED REPO
+  * push_repo     — pushes an existing branch to an existing remote
+  * There is no "rescue everything" tool. The view loops over the repos
+    the human checked, so every write is one explicit, named action.
+  * No tool force-pushes, rebases, resets, discards, or deletes. Nothing
+    here can lose work; the worst case is an unwanted commit, which is
+    itself recoverable.
+"""
+
+import importlib.machinery
+import importlib.util
+import os
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(HERE), "lib"))
+
+from mcpkit import Server, JsonRpcError, log  # noqa: E402
+from uikit import page  # noqa: E402
+
+_spec = importlib.util.spec_from_loader(
+    "salvager_cli",
+    importlib.machinery.SourceFileLoader("salvager_cli",
+                                         os.path.join(HERE, "salvager")))
+salvager_cli = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(salvager_cli)
+
+VIEW_URI = "ui://salvager/triage"
+
+VIEW_CSS = """
+.repo { display:flex; gap:10px; align-items:flex-start; padding:9px 11px;
+        border:1px solid var(--color-border-primary);
+        border-radius:var(--border-radius-md); margin-bottom:6px; }
+.repo.sel { border-color:var(--color-text-primary); }
+.repo input { margin-top:3px; }
+.rpath { font-family:var(--font-mono); font-size:12px; word-break:break-all; }
+.rmeta { font-size:11.5px; color:var(--color-text-secondary); margin-top:2px; }
+.rwarn { font-size:11.5px; color:var(--color-text-warning); margin-top:2px; }
+.grow { flex:1; min-width:0; }
+.bar { display:flex; gap:6px; align-items:center; margin-bottom:10px; flex-wrap:wrap; }
+.spacer { flex:1; }
+.msgbox { margin:8px 0; display:none; }
+.result { font-size:12px; margin-top:4px; }
+.result.ok { color:var(--color-text-success); }
+.result.bad { color:var(--color-text-danger); }
+.stat { font-size:12px; color:var(--color-text-secondary); }
+"""
+
+VIEW_BODY = """
+<div class="hdr">
+  <h1>Unsaved work</h1>
+  <span class="stat" id="summary"></span>
+</div>
+<div class="bar">
+  <button id="selall">Select all</button>
+  <button id="selnone">Clear</button>
+  <div class="spacer"></div>
+  <button id="commit">Commit selected…</button>
+  <button id="push" class="primary">Push selected</button>
+</div>
+<div class="msgbox" id="msgbox">
+  <input type="text" id="msg" placeholder="Commit message"
+         value="salvage: commit work in progress">
+</div>
+<div id="list" class="loading">loading…</div>
+"""
+
+VIEW_JS = r"""
+let REPOS = [], SEL = new Set();
+
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+const band = (s) => s >= 100 ? ['danger','CRITICAL']
+  : s >= 40 ? ['warn','HIGH'] : s >= 12 ? ['neutral','MEDIUM'] : ['neutral','LOW'];
+
+function describe(r) {
+  const b = [];
+  const un = (r.dirty || 0) + (r.staged || 0);
+  if (un) b.push(un + ' uncommitted');
+  if (r.untracked) b.push(r.untracked + ' untracked');
+  if (r.stashes) b.push(r.stashes + ' stash' + (r.stashes > 1 ? 'es' : ''));
+  if (r.orphan_commits) b.push(r.orphan_commits + ' commits on no remote');
+  if (r.unpushed) b.push(r.unpushed + ' unpushed');
+  if (!r.has_remote) b.push('no remote');
+  return b.join(' · ') || 'clean';
+}
+
+function render() {
+  const list = document.getElementById('list');
+  document.getElementById('summary').textContent =
+    REPOS.length + ' repos at risk · ' + SEL.size + ' selected';
+  if (!REPOS.length) {
+    list.className = 'empty';
+    list.textContent = 'nothing at risk — everything is committed and pushed';
+    return;
+  }
+  list.className = '';
+  list.innerHTML = REPOS.map((r, i) => {
+    const [cls, label] = band(r._score || 0);
+    const warns = (r.no_upstream || []).slice(0, 3).map(
+      ([br, n]) => `<div class="rwarn">! branch '${esc(br)}' has ${n} commits and no upstream</div>`
+    ).join('');
+    return `
+      <div class="repo ${SEL.has(r.path) ? 'sel' : ''}" data-i="${i}">
+        <input type="checkbox" data-sel="${i}" ${SEL.has(r.path) ? 'checked' : ''}>
+        <div class="grow">
+          <div class="row">
+            <span class="pill ${cls}">${label}</span>
+            <span class="rpath">${esc(r.path)}</span>
+          </div>
+          <div class="rmeta">${esc(r.branch)} · ${esc(describe(r))}</div>
+          ${warns}
+          <div class="result" id="res-${i}"></div>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+document.addEventListener('change', (e) => {
+  const i = e.target.getAttribute && e.target.getAttribute('data-sel');
+  if (i === null || i === undefined) return;
+  const r = REPOS[+i];
+  if (e.target.checked) SEL.add(r.path); else SEL.delete(r.path);
+  render();
+});
+
+document.addEventListener('click', async (e) => {
+  const id = e.target.id;
+  if (id === 'selall') { REPOS.forEach(r => SEL.add(r.path)); render(); return; }
+  if (id === 'selnone') { SEL.clear(); render(); return; }
+
+  if (id === 'commit') {
+    const box = document.getElementById('msgbox');
+    if (box.style.display !== 'block') { box.style.display = 'block'; return; }
+    await runAll('commit_repo', () => ({ message: document.getElementById('msg').value }));
+    return;
+  }
+  if (id === 'push') { await runAll('push_repo', () => ({})); return; }
+});
+
+async function runAll(tool, extra) {
+  const paths = [...SEL];
+  if (!paths.length) return;
+  const btn = document.getElementById(tool === 'commit_repo' ? 'commit' : 'push');
+  btn.disabled = true;
+  const done = [], failed = [];
+  for (const p of paths) {
+    const i = REPOS.findIndex(r => r.path === p);
+    const cell = document.getElementById('res-' + i);
+    if (cell) cell.textContent = '…';
+    try {
+      const res = await MCP.callTool(tool, Object.assign({ path: p }, extra()));
+      const d = structuredOf(res) || {};
+      if (cell) {
+        cell.className = 'result ' + (d.ok ? 'ok' : 'bad');
+        cell.textContent = d.summary || (d.ok ? 'done' : 'failed');
+      }
+      (d.ok ? done : failed).push(p);
+    } catch (err) {
+      if (cell) { cell.className = 'result bad'; cell.textContent = err.message; }
+      failed.push(p);
+    }
+  }
+  btn.disabled = false;
+  const verb = tool === 'commit_repo' ? 'Committed' : 'Pushed';
+  MCP.updateContext(
+    `${verb} ${done.length} repo(s)` +
+    (failed.length ? `; ${failed.length} failed` : '') + '. ' +
+    (done.length ? 'Succeeded: ' + done.join(', ') + '. ' : '') +
+    (failed.length ? 'Failed: ' + failed.join(', ') + '.' : ''),
+    { action: tool, succeeded: done, failed });
+  await refresh();
+}
+
+async function refresh() {
+  const res = await MCP.callTool('scan_repos', {});
+  const d = structuredOf(res) || {};
+  REPOS = d.at_risk || [];
+  SEL = new Set([...SEL].filter(p => REPOS.some(r => r.path === p)));
+  render();
+}
+
+(async () => {
+  await MCP.init({ name: 'salvager-view' });
+  onToolData(({ result }) => {
+    const d = structuredOf(result);
+    if (d && d.at_risk) { REPOS = d.at_risk; render(); }
+  });
+})();
+"""
+
+
+srv = Server(
+    "salvager",
+    instructions=(
+        "Finds git work that exists only on this disk: uncommitted edits, "
+        "stashes, and commits on branches with no upstream. Ranked by what "
+        "would be unrecoverable. Read-only except for explicit per-repo "
+        "commit/push."),
+)
+
+srv.resource(
+    VIEW_URI, "Salvage Triage",
+    page("SALVAGER", VIEW_BODY, VIEW_CSS, VIEW_JS),
+    description="Select repos with unsaved work and commit or push them.",
+    csp={},
+    prefers_border=True,
+)
+
+
+@srv.tool(
+    "scan_repos",
+    "Scan every git repo on this machine for work that exists nowhere else: "
+    "uncommitted edits, untracked files, stashes, unpushed commits, and "
+    "branches with no upstream. Ranked by how much would be unrecoverable.",
+    {"type": "object", "properties": {
+        "roots": {"type": "array", "items": {"type": "string"},
+                  "description": "Roots to scan; defaults to the standard set."}}},
+    resource_uri=VIEW_URI,
+)
+def scan_repos(roots=None):
+    roots = roots or (salvager_cli.DEFAULT_ROOTS + salvager_cli.user_homes())
+    start = time.time()
+    results = salvager_cli.scan(roots)
+    risky = sorted([r for r in results if salvager_cli.at_risk(r)],
+                   key=lambda r: -r["_score"])
+    now = time.time()
+    lines = [f"Scanned {len(results):,} repos in {now - start:.0f}s; "
+             f"{len(risky)} have work at risk.", ""]
+    for r in risky[:40]:
+        age = salvager_cli.human_age(now - r["last_commit"]) if r["last_commit"] else "?"
+        lines.append(f'- [{r["_score"]:.0f}] {r["path"]} ({r["branch"]}) '
+                     f'{salvager_cli.describe(r)} · last commit {age} ago')
+        for br, n in r["no_upstream"][:3]:
+            lines.append(f"    ! branch '{br}' has {n} commits and no upstream")
+    if len(risky) > 40:
+        lines.append(f"… and {len(risky) - 40} more")
+    return "\n".join(lines), {"at_risk": risky, "scanned": len(results)}
+
+
+def _git(path, *args, timeout=60):
+    """Run one git command, returning (ok, output)."""
+    import subprocess
+    try:
+        p = subprocess.run(["git", "-C", path] + list(args),
+                           capture_output=True, text=True, timeout=timeout)
+        return p.returncode == 0, (p.stdout + p.stderr).strip()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, str(e)
+
+
+def _is_repo(path):
+    ok, _ = _git(path, "rev-parse", "--is-inside-work-tree", timeout=15)
+    return ok
+
+
+@srv.tool(
+    "commit_repo",
+    "Stage all changes in ONE repository and commit them. Does not push. "
+    "Never discards, resets, or rewrites history.",
+    {"type": "object", "properties": {
+        "path": {"type": "string", "description": "Repository path."},
+        "message": {"type": "string", "description": "Commit message."}},
+     "required": ["path"]},
+)
+def commit_repo(path, message="salvage: commit work in progress"):
+    if not _is_repo(path):
+        raise JsonRpcError(-32602, f"not a git repository: {path}")
+    ok, out = _git(path, "add", "-A")
+    if not ok:
+        return f"Failed to stage {path}: {out}", {"ok": False, "path": path,
+                                                  "summary": "stage failed"}
+    ok, out = _git(path, "commit", "-m", message)
+    if not ok:
+        # "nothing to commit" is a benign no-op, not a failure worth alarm.
+        benign = "nothing to commit" in out
+        return (f"{'Nothing to commit in' if benign else 'Commit failed in'} "
+                f"{path}: {out}",
+                {"ok": benign, "path": path,
+                 "summary": "nothing to commit" if benign else "commit failed"})
+    log(f"[salvager] committed {path}")
+    return f"Committed in {path}.\n{out}", {"ok": True, "path": path,
+                                            "summary": "committed"}
+
+
+@srv.tool(
+    "push_repo",
+    "Push the current branch of ONE repository to its remote, setting "
+    "upstream if absent. Never force-pushes.",
+    {"type": "object", "properties": {
+        "path": {"type": "string"},
+        "remote": {"type": "string", "description": "Defaults to origin."}},
+     "required": ["path"]},
+)
+def push_repo(path, remote=""):
+    if not _is_repo(path):
+        raise JsonRpcError(-32602, f"not a git repository: {path}")
+    ok, remotes = _git(path, "remote")
+    if not ok or not remotes.strip():
+        return (f"{path} has no remote configured — pushing cannot rescue it. "
+                f"Add a remote first."),  {"ok": False, "path": path,
+                                           "summary": "no remote"}
+    remote = remote or ("origin" if "origin" in remotes.split()
+                        else remotes.split()[0])
+    ok, branch = _git(path, "rev-parse", "--abbrev-ref", "HEAD")
+    if not ok:
+        raise JsonRpcError(-32603, "could not determine current branch")
+    # -u sets upstream when missing; no --force, ever.
+    ok, out = _git(path, "push", "-u", remote, branch, timeout=180)
+    if not ok:
+        return f"Push failed for {path}: {out}", {"ok": False, "path": path,
+                                                  "summary": "push failed"}
+    log(f"[salvager] pushed {path} -> {remote}/{branch}")
+    return (f"Pushed {branch} to {remote} from {path}.\n{out}",
+            {"ok": True, "path": path, "summary": f"pushed to {remote}/{branch}"})
+
+
+if __name__ == "__main__":
+    srv.serve()

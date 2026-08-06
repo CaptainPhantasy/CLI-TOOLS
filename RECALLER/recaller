@@ -1,0 +1,726 @@
+#!/usr/bin/env python3
+"""RECALLER — recover the command you already got working once.
+
+Searches every agent session transcript on this machine — jcode, codex,
+claude, and friends — for the thing you know you solved before but can't
+remember. Returns the exact command with the context around it, ranked
+so commands that actually SUCCEEDED outrank ones that errored.
+
+    recaller "the ffmpeg flag that fixed audio drift"
+    recaller --cmd "docker run"        literal command substring
+    recaller --file report.tsx         sessions that touched a file
+    recaller index                     rebuild the transcript index
+    recaller info                      index stats and sources
+    recaller --json                    machine-readable
+    recaller --help                    usage
+
+Without an API key RECALLER still works as a fast local search. With one,
+GLM deduces what you meant from a vague description and ranks the hits.
+
+Read-only. Never modifies a transcript.
+
+Zero dependencies. Config shared with qglm (~/.qglm.yaml / QGLM_API_KEY).
+"""
+
+import argparse
+import glob
+import hashlib
+import json
+import os
+import re
+import sys
+import time
+
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib"))
+
+from clikit import (C, call_glm, clipboard_copy, frame, hero_block,  # noqa: E402
+                    human_age, load_config, merge_usage, stat_line,
+                    telemetry_line, term_width, tilde, user_homes,
+                    wrap_block)
+
+HERO = r"""
+ █▀▀▀▀▀▄  █▀▀▀▀▀  ▄▀▀▀▀▀▄  ▄▀▀▀▀▀▄  █      █      █▀▀▀▀▀  █▀▀▀▀▀▄
+ █▄▄▄▄▄▀  █▄▄▄▄   █        █▄▄▄▄▄█  █      █      █▄▄▄▄   █▄▄▄▄▄▀
+ █    ▀▄  █       █        █     █  █      █      █       █    ▀▄
+ █     █  █▄▄▄▄▄  ▀▄▄▄▄▄▄  █     █  █▄▄▄▄  █▄▄▄▄  █▄▄▄▄▄  █     █
+""".strip("\n")
+
+# teal ramp, matching skiller's family resemblance
+RAMP = (159, 123, 87, 51)
+
+TAGLINE = "you solved this before · find it · run it again"
+
+SHARED_HOME = os.environ.get("RECALLER_SHARED_HOME",
+                             "/usr/local/share/recaller")
+USER_HOME = os.path.join(os.path.expanduser("~"), ".recaller")
+INDEX_NAME = "index.json"
+
+# Where each harness keeps transcripts, relative to a user's home.
+SOURCES = [
+    ("jcode",  ".jcode/sessions",   "**/*.jsonl"),
+    ("codex",  ".codex/sessions",   "**/*.jsonl"),
+    ("claude", ".claude/projects",  "**/*.jsonl"),
+    ("claude", ".claude/history",   "**/*.jsonl"),
+    ("opencode", ".opencode",       "**/*.jsonl"),
+    ("cursor", ".cursor",           "**/*.jsonl"),
+    ("grok",   ".grok",             "**/*.jsonl"),
+    ("pi",     ".pi/sessions",      "**/*.jsonl"),
+]
+
+# Commands too trivial to be worth recalling.
+BORING = re.compile(
+    r"^\s*(ls|cd|pwd|clear|exit|echo|cat|which|whoami|date|true|false|"
+    r"git status|git diff|git log|ll|la)\b\s*[^&|;]*$", re.I)
+
+MAX_CMD = 800
+
+
+# ---------------------------------------------------------------- extraction
+
+def _text_of(content):
+    """Flatten the several content shapes these harnesses use."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for b in content:
+            if isinstance(b, dict):
+                parts.append(b.get("text") or b.get("content") or "")
+            elif isinstance(b, str):
+                parts.append(b)
+        return "\n".join(p for p in parts if p)
+    if isinstance(content, dict):
+        return content.get("text") or ""
+    return ""
+
+
+def extract_command(name, args):
+    """Pull a shell command out of a tool call, whatever the tool is named."""
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except (json.JSONDecodeError, TypeError):
+            return args[:MAX_CMD] if name.lower() in (
+                "bash", "shell", "exec_command", "run") else ""
+    if not isinstance(args, dict):
+        return ""
+    for key in ("command", "cmd", "script", "shell_command"):
+        v = args.get(key)
+        if isinstance(v, list):
+            v = " ".join(str(x) for x in v)
+        if isinstance(v, str) and v.strip():
+            return v.strip()[:MAX_CMD]
+    return ""
+
+
+def parse_codex(path, rec):
+    """Codex: {timestamp, type, payload}. Records exit codes, which lets
+    us rank commands that actually worked above ones that failed."""
+    pending = {}
+    for line in _lines(path):
+        try:
+            o = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        p = o.get("payload") or {}
+        t = p.get("type")
+        ts = o.get("timestamp", "")
+        if t == "session_meta":
+            rec["cwd"] = p.get("cwd", rec.get("cwd", ""))
+        elif t == "user_message":
+            rec["prompts"].append((ts, (p.get("message") or "")[:600]))
+        elif t in ("function_call", "custom_tool_call"):
+            cmd = extract_command(p.get("name", ""),
+                                  p.get("arguments") or p.get("input") or "")
+            if cmd:
+                pending[p.get("call_id")] = (ts, cmd)
+        elif t in ("function_call_output", "custom_tool_call_output"):
+            hit = pending.pop(p.get("call_id"), None)
+            if hit:
+                out = str(p.get("output") or "")
+                ok = "Process exited with code 0" in out or "Exit code: 0" in out
+                failed = bool(re.search(
+                    r"exited with code [1-9]|Exit code: [1-9]|"
+                    r"command not found|No such file", out))
+                rec["commands"].append({
+                    "ts": hit[0], "cmd": hit[1],
+                    "ok": ok and not failed,
+                    "failed": failed,
+                    "out": out[:400],
+                })
+
+
+def parse_jcode(path, rec):
+    """jcode: {meta, append_messages[]} with content blocks."""
+    for line in _lines(path):
+        try:
+            o = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        meta = o.get("meta") or {}
+        if meta.get("working_dir"):
+            rec["cwd"] = meta["working_dir"]
+        if meta.get("model"):
+            rec["model"] = meta["model"]
+        for m in o.get("append_messages") or []:
+            role = m.get("role")
+            ts = m.get("timestamp", "")
+            text = _text_of(m.get("content"))
+            if role == "user" and text:
+                rec["prompts"].append((ts, text[:600]))
+            elif role == "assistant":
+                for b in (m.get("content") or []):
+                    if isinstance(b, dict) and b.get("type") == "tool_use":
+                        cmd = extract_command(b.get("name", ""),
+                                              b.get("input") or {})
+                        if cmd:
+                            rec["commands"].append({
+                                "ts": ts, "cmd": cmd, "ok": False,
+                                "failed": False, "out": ""})
+            elif role in ("tool", "user") and isinstance(m.get("content"), list):
+                for b in m["content"]:
+                    if isinstance(b, dict) and b.get("type") == "tool_result":
+                        txt = _text_of(b.get("content"))
+                        if rec["commands"] and txt:
+                            last = rec["commands"][-1]
+                            if not last["out"]:
+                                last["out"] = txt[:400]
+                                last["failed"] = bool(re.search(
+                                    r"(?i)\berror\b|command not found|"
+                                    r"Exit code: [1-9]|Traceback", txt))
+                                last["ok"] = not last["failed"]
+
+
+def parse_claude(path, rec):
+    """Claude Code: one message object per line, type=user|assistant."""
+    for line in _lines(path):
+        try:
+            o = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        t = o.get("type")
+        ts = o.get("timestamp", "")
+        if o.get("cwd"):
+            rec["cwd"] = o["cwd"]
+        msg = o.get("message") or o
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if t == "user":
+            text = _text_of(content)
+            if text and not text.startswith("<"):
+                rec["prompts"].append((ts, text[:600]))
+            if isinstance(content, list):
+                for b in content:
+                    if isinstance(b, dict) and b.get("type") == "tool_result":
+                        txt = _text_of(b.get("content"))
+                        if rec["commands"] and txt:
+                            last = rec["commands"][-1]
+                            if not last["out"]:
+                                last["out"] = txt[:400]
+                                last["failed"] = bool(re.search(
+                                    r"(?i)\berror\b|command not found|"
+                                    r"Exit code: [1-9]", txt))
+                                last["ok"] = not last["failed"]
+        elif t == "assistant" and isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "tool_use":
+                    cmd = extract_command(b.get("name", ""), b.get("input") or {})
+                    if cmd:
+                        rec["commands"].append({
+                            "ts": ts, "cmd": cmd, "ok": False,
+                            "failed": False, "out": ""})
+
+
+PARSERS = {"codex": parse_codex, "jcode": parse_jcode, "claude": parse_claude}
+
+
+def _lines(path, limit=60000):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i >= limit:
+                    return
+                line = line.strip()
+                if line:
+                    yield line
+    except OSError:
+        return
+
+
+def parse_session(path, harness):
+    rec = {"path": path, "harness": harness, "cwd": "", "model": "",
+           "prompts": [], "commands": []}
+    parser = PARSERS.get(harness)
+    if parser is None:
+        # Unknown harness: try each parser, keep whichever found the most.
+        best = None
+        for fn in (parse_codex, parse_jcode, parse_claude):
+            trial = dict(rec, prompts=[], commands=[])
+            try:
+                fn(path, trial)
+            except Exception:
+                continue
+            if best is None or len(trial["commands"]) > len(best["commands"]):
+                best = trial
+        rec = best or rec
+    else:
+        try:
+            parser(path, rec)
+        except Exception:
+            pass
+    try:
+        rec["mtime"] = os.path.getmtime(path)
+    except OSError:
+        rec["mtime"] = 0
+    return rec
+
+
+# ---------------------------------------------------------------- index
+
+def index_paths():
+    shared = os.path.join(SHARED_HOME, INDEX_NAME)
+    user = os.path.join(USER_HOME, INDEX_NAME)
+    return shared, user
+
+
+def read_index_path():
+    shared, user = index_paths()
+    cands = [p for p in (shared, user) if os.path.isfile(p)]
+    if not cands:
+        return shared
+    return max(cands, key=os.path.getmtime)
+
+
+def write_index_path():
+    shared, user = index_paths()
+    d = os.path.dirname(shared)
+    probe = d if os.path.isdir(d) else os.path.dirname(d)
+    if os.access(probe, os.W_OK):
+        return shared
+    return user
+
+
+def discover(roots=None):
+    """Every transcript file on the machine, with its harness label."""
+    found = []
+    for home in (roots or user_homes()):
+        for harness, subdir, pattern in SOURCES:
+            base = os.path.join(home, subdir)
+            if not os.path.isdir(base):
+                continue
+            for p in glob.glob(os.path.join(base, pattern), recursive=True):
+                if os.path.isfile(p):
+                    found.append((harness, p))
+    return found
+
+
+def build_index(progress=None):
+    files = discover()
+    entries = []
+    for i, (harness, path) in enumerate(files):
+        if progress and i % 20 == 0:
+            progress(f"parsing {i:,}/{len(files):,} · {os.path.basename(path)}")
+        rec = parse_session(path, harness)
+        if not rec["commands"] and not rec["prompts"]:
+            continue
+        # Keep only interesting commands, so the index stays small enough
+        # to search instantly and to fit in a model prompt later.
+        cmds = []
+        seen = set()
+        for c in rec["commands"]:
+            cmd = c["cmd"].strip()
+            if not cmd or BORING.match(cmd):
+                continue
+            h = hashlib.sha1(cmd.encode()).hexdigest()[:10]
+            if h in seen:
+                continue
+            seen.add(h)
+            cmds.append(c)
+        if not cmds:
+            continue
+        entries.append({
+            "path": path, "harness": harness, "cwd": rec.get("cwd", ""),
+            "model": rec.get("model", ""), "mtime": rec["mtime"],
+            "prompts": [p[1] for p in rec["prompts"][:6]],
+            "commands": cmds[:200],
+        })
+    index = {
+        "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "files_seen": len(files),
+        "sessions": len(entries),
+        "commands": sum(len(e["commands"]) for e in entries),
+        "entries": entries,
+    }
+    out = write_index_path()
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    tmp = out + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(index, fh)
+    os.replace(tmp, out)
+    if out.startswith(SHARED_HOME):
+        try:
+            os.chmod(out, 0o644)
+        except OSError:
+            pass
+    return index
+
+
+def load_index(auto_build=True):
+    p = read_index_path()
+    try:
+        with open(p, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        if not auto_build:
+            return None
+        live = sys.stderr.isatty()
+
+        def progress(msg):
+            if live:
+                sys.stderr.write("\r  ◈ " + msg[:70].ljust(72))
+                sys.stderr.flush()
+        sys.stderr.write("  first run — indexing your session transcripts\n")
+        idx = build_index(progress)
+        if live:
+            sys.stderr.write("\r" + " " * 78 + "\r")
+        return idx
+
+
+# ---------------------------------------------------------------- search
+
+STOP = {"the", "a", "an", "that", "this", "was", "were", "is", "for", "to",
+        "of", "in", "on", "with", "and", "or", "my", "i", "it", "how", "do",
+        "did", "what", "when", "which", "one", "used", "use", "get", "got"}
+
+
+def tokens(s):
+    return [t for t in re.findall(r"[a-z0-9.+_-]{2,}", s.lower())
+            if t not in STOP]
+
+
+def build_df(index):
+    """Document frequency per token across all commands.
+
+    Without this, a query like "ffmpeg video frame" is dominated by
+    'frame' (in 167 commands) while the discriminating term 'ffmpeg'
+    (in 0) contributes nothing. Rare terms must outweigh common ones."""
+    df = {}
+    total = 0
+    for e in index["entries"]:
+        for c in e["commands"]:
+            total += 1
+            for t in set(tokens(c["cmd"])):
+                df[t] = df.get(t, 0) + 1
+    return df, max(1, total)
+
+
+def idf(df, total, term):
+    import math
+    return math.log(1.0 + total / (1.0 + df.get(term, 0)))
+
+
+def search(index, query, cmd_filter="", file_filter="", limit=25):
+    words = tokens(query)
+    df, total = build_df(index)
+    weights = {w: idf(df, total, w) for w in words}
+    # If none of the query terms appear anywhere, say so rather than
+    # returning whatever happened to share a common word.
+    if words and all(df.get(w, 0) == 0 for w in words):
+        return []
+    hits = []
+    now = time.time()
+    for e in index["entries"]:
+        ctx = " ".join(e["prompts"]).lower() + " " + e.get("cwd", "").lower()
+        for c in e["commands"]:
+            cmd = c["cmd"]
+            low = cmd.lower()
+            if cmd_filter and cmd_filter.lower() not in low:
+                continue
+            if file_filter and file_filter.lower() not in (
+                    low + " " + ctx + " " + c.get("out", "").lower()):
+                continue
+            score = 0.0
+            matched = 0
+            for w in words:
+                weight = weights[w]
+                if w in low:
+                    score += 3.0 * weight     # match in the command itself
+                    matched += 1
+                elif w in ctx:
+                    score += 1.0 * weight     # match in the conversation
+                    matched += 1
+                elif w in c.get("out", "").lower():
+                    score += 0.7 * weight     # match in the output
+                    matched += 1
+            if not words and (cmd_filter or file_filter):
+                score = 1.0
+            if score <= 0:
+                continue
+            # Reward covering more of the query, so a command matching
+            # three query terms beats one matching a single common term.
+            if words:
+                score *= (matched / len(words)) ** 0.5
+            # A command that exited 0 is worth more than one that errored:
+            # the whole point is to recover something that WORKED.
+            if c.get("ok"):
+                score *= 1.8
+            elif c.get("failed"):
+                score *= 0.45
+            # Recency as a mild tiebreak, not a dominant term.
+            age_days = max(0.0, (now - e["mtime"]) / 86400.0)
+            score *= 1.0 / (1.0 + age_days / 120.0)
+            hits.append((score, e, c))
+    hits.sort(key=lambda x: -x[0])
+    # The same command often appears in many sessions. Show each distinct
+    # command once, keeping its best-scoring (usually successful, usually
+    # most recent) instance, so the list is varied rather than repetitive.
+    best = {}
+    for score, e, c in hits:
+        key = re.sub(r"\s+", " ", c["cmd"].strip())
+        if key not in best:
+            best[key] = (score, e, c)
+    return list(best.values())[:limit]
+
+
+# ---------------------------------------------------------------- GLM rank
+
+RANK_SYSTEM = """You are RECALL-SCOUT. The user half-remembers something \
+they did before and wants the exact command back.
+
+You are given their description and a list of candidate commands recovered \
+from their own session transcripts, with the surrounding context and \
+whether the command succeeded.
+
+Your job:
+- Pick the ONE command that best matches what they are describing.
+- Print it alone on a line in a fenced code block, exactly as recorded.
+- Then in at most 3 short lines: where it came from, what it did, and any \
+adjustment needed for today (paths that may have moved, flags that may \
+have changed).
+- If several candidates are plausible, name the runner-up in one line.
+- If nothing matches, say so plainly. Do not invent a command.
+
+Never fabricate flags or paths that are not in the candidates.
+"""
+
+
+def rank(query, hits, cfg):
+    rows = []
+    for i, (score, e, c) in enumerate(hits[:20], 1):
+        status = "OK" if c.get("ok") else ("FAILED" if c.get("failed")
+                                           else "unknown")
+        ctx = (e["prompts"][0][:200] if e["prompts"] else "")
+        rows.append(
+            f'[{i}] ({status}) {c["cmd"]}\n'
+            f'    harness={e["harness"]} cwd={e.get("cwd", "?")} '
+            f'when={human_age(time.time() - e["mtime"])} ago\n'
+            f'    context: {ctx}')
+    user = (f"I am trying to remember: {query}\n\n"
+            f"Candidates from my own transcripts:\n\n" + "\n".join(rows))
+    text, _, usage = call_glm(
+        cfg,
+        [{"role": "system", "content": RANK_SYSTEM},
+         {"role": "user", "content": user}],
+        temperature=0.1, max_tokens=900, label="recalling")
+    return text.strip(), usage
+
+
+# ---------------------------------------------------------------- views
+
+def flatten_cmd(cmd, width):
+    """One-line form of a possibly multi-line command, for the list view.
+
+    Heredocs and multi-line scripts would otherwise blow the frame apart,
+    since the renderer assumes one visual row per entry."""
+    one = re.sub(r"\s*\n\s*", " ⏎ ", cmd.strip())
+    one = re.sub(r"\s{2,}", " ", one)
+    return one[:width]
+
+
+def render_hits(hits, w):
+    inner = w - 6
+    now = time.time()
+    lines = []
+    if not hits:
+        lines.append(C.dim("  no matches — try fewer words, or "
+                           "`recaller index` to refresh"))
+    for score, e, c in hits:
+        mark = (C.ok("✓") if c.get("ok")
+                else (C.bad("✗") if c.get("failed") else C.dim("·")))
+        lines.append(mark + " " + C.body(flatten_cmd(c["cmd"], inner - 4)))
+        lines.append(C.dim(f'    {e["harness"]} · '
+                           f'{human_age(now - e["mtime"])} ago · '
+                           f'{tilde(e.get("cwd") or e["path"])}'))
+        if e["prompts"]:
+            prompt = re.sub(r"\s+", " ", e["prompts"][0]).strip()
+            lines.append(C.dim(f'    “{prompt[:inner - 8]}”'))
+    return frame(lines, title="recaller · matches",
+                 footer=f"{len(hits)} hits", width=w)
+
+
+def view_index():
+    w = term_width()
+    live = sys.stderr.isatty()
+
+    def progress(msg):
+        if live:
+            sys.stderr.write("\r  ◈ " + msg[:70].ljust(72))
+            sys.stderr.flush()
+    print()
+    print(hero_block(HERO, TAGLINE, RAMP, w))
+    print()
+    start = time.time()
+    idx = build_index(progress)
+    if live:
+        sys.stderr.write("\r" + " " * 78 + "\r")
+    inner = w - 6
+    print(frame([
+        stat_line("Files", f'{idx["files_seen"]:,} transcripts', inner),
+        stat_line("Sessions", f'{idx["sessions"]:,} with usable commands',
+                  inner),
+        stat_line("Commands", f'{idx["commands"]:,} distinct', inner),
+        stat_line("Took", f"{time.time() - start:.0f}s", inner),
+        stat_line("Index", tilde(write_index_path()), inner),
+    ], title="index rebuilt", width=w))
+    print()
+    return 0
+
+
+def view_info():
+    w = term_width()
+    inner = w - 6
+    cfg = load_config("RECALLER_MODEL")
+    idx = load_index(auto_build=False)
+    print()
+    print(hero_block(HERO, TAGLINE, RAMP, w))
+    print()
+    lines = [
+        stat_line("Engine", cfg["model"], inner),
+        stat_line("API key", "configured" if cfg["api_key"] else
+                  "missing (local search still works)", inner),
+        stat_line("Index", tilde(read_index_path()), inner),
+    ]
+    if idx:
+        lines += [
+            stat_line("Sessions", f'{idx["sessions"]:,} · built '
+                      f'{idx["built_at"]}', inner),
+            stat_line("Commands", f'{idx["commands"]:,} recoverable', inner),
+        ]
+        by = {}
+        for e in idx["entries"]:
+            by[e["harness"]] = by.get(e["harness"], 0) + 1
+        lines.append(stat_line("Sources", ", ".join(
+            f"{k} {v}" for k, v in sorted(by.items(), key=lambda x: -x[1])),
+            inner))
+    else:
+        lines.append(stat_line("Index", "not built — run: recaller index",
+                               inner))
+    print(frame(lines, title="recaller info", width=w))
+    print()
+    return 0
+
+
+def view_help():
+    w = term_width()
+    print()
+    print(hero_block(HERO, TAGLINE, RAMP, w))
+    print()
+    lines = [
+        C.key('recaller "vague description"') +
+        C.dim("   find it and rank with GLM"),
+        C.key('recaller --cmd "docker run"') +
+        C.dim("    literal command substring"),
+        C.key("recaller --file report.tsx") +
+        C.dim("     sessions that touched a file"),
+        C.key("recaller --local") + C.dim("               skip GLM, local search only"),
+        C.key("recaller index") + C.dim("                 rebuild the index"),
+        C.key("recaller info") + C.dim("                  index stats"),
+        "",
+        C.dim("Commands that exited 0 rank above ones that errored, so what"),
+        C.dim("you get back is what actually worked."),
+        "",
+        C.dim("Sources: jcode · codex · claude · opencode · cursor · grok"),
+    ]
+    print(frame(lines, title="recaller · usage", width=w))
+    print()
+    return 0
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("words", nargs="*")
+    ap.add_argument("--cmd", default="")
+    ap.add_argument("--file", default="")
+    ap.add_argument("--local", action="store_true")
+    ap.add_argument("--limit", type=int, default=25)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("-h", "--help", action="store_true")
+    args = ap.parse_args(argv)
+
+    first = args.words[0] if args.words else ""
+    if args.help or first in ("help", "--help"):
+        return view_help()
+    if first == "index":
+        return view_index()
+    if first == "info":
+        return view_info()
+
+    query = " ".join(args.words)
+    if not query and not args.cmd and not args.file:
+        return view_help()
+
+    w = term_width()
+    if not args.json:
+        print()
+        print(hero_block(HERO, TAGLINE, RAMP, w))
+        print()
+
+    index = load_index()
+    hits = search(index, query, args.cmd, args.file, args.limit)
+
+    if args.json:
+        print(json.dumps([{
+            "cmd": c["cmd"], "ok": c.get("ok"), "harness": e["harness"],
+            "cwd": e.get("cwd"), "path": e["path"], "score": round(s, 2),
+        } for s, e, c in hits], indent=2))
+        return 0
+
+    print(render_hits(hits, w))
+    print()
+
+    if not hits:
+        return 1
+
+    cfg = load_config("RECALLER_MODEL")
+    if args.local or not cfg["api_key"] or not query:
+        # Local mode still delivers: put the best command on the clipboard.
+        best = hits[0][2]["cmd"]
+        if clipboard_copy(best):
+            print(C.ok("  ✓ top match copied to clipboard"))
+            print()
+        return 0
+
+    inner = w - 6
+    text, usage = rank(query, hits, cfg)
+    lines = []
+    for ln in text.split("\n"):
+        lines.extend(wrap_block(ln, inner) if ln.strip() else [""])
+    print(frame(lines, title="recall · best match", width=w))
+    print(telemetry_line(merge_usage(usage), cfg["model"]))
+    print()
+
+    # Prefer copying the fenced command alone; fall back to the whole reply.
+    m = re.search(r"```(?:[a-z]*\n)?(.+?)```", text, re.S)
+    payload = m.group(1).strip() if m else text
+    if clipboard_copy(payload):
+        print(C.ok("  ✓ command copied to clipboard"))
+        print()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.stderr.write("\n  interrupted\n")
+        sys.exit(130)

@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""register-mcp — add the CLITOOLS MCP Apps servers to your MCP hosts.
+
+Registers keyring / salvager / recaller with whichever hosts are present
+on this machine (jcode, Claude Desktop, Claude Code). Idempotent: running
+it twice changes nothing the second time.
+
+    ./register-mcp            show what would change
+    ./register-mcp --apply    write the config files
+    ./register-mcp --remove   unregister
+
+Every file is backed up next to itself before being written.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import sys
+import time
+
+TOOLS = os.path.dirname(os.path.realpath(__file__))
+PY = sys.executable
+
+SERVERS = {
+    "keyring":  os.path.join(TOOLS, "KEYRING", "keyring-app"),
+    "salvager": os.path.join(TOOLS, "SALVAGER", "salvager-app"),
+    "recaller": os.path.join(TOOLS, "RECALLER", "recaller-app"),
+}
+
+# (label, path, key holding the server map)
+HOSTS = [
+    ("jcode", os.path.expanduser("~/.jcode/mcp.json"), "servers"),
+    ("claude-desktop",
+     os.path.expanduser("~/Library/Application Support/Claude/"
+                        "claude_desktop_config.json"), "mcpServers"),
+    ("claude-code", os.path.expanduser("~/.claude.json"), "mcpServers"),
+]
+
+
+def entry(path):
+    return {"command": PY, "args": [path], "env": {}}
+
+
+def load(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def backup(path):
+    dst = f"{path}.backup-before-clitools-mcp-{int(time.time())}"
+    shutil.copy2(path, dst)
+    return dst
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--apply", action="store_true")
+    ap.add_argument("--remove", action="store_true")
+    a = ap.parse_args()
+
+    for name, path in SERVERS.items():
+        if not os.path.isfile(path):
+            print(f"! missing server: {path}")
+            return 1
+
+    changed_any = False
+    for label, path, key in HOSTS:
+        if not os.path.exists(path):
+            print(f"- {label:16} not installed ({path})")
+            continue
+        cfg = load(path)
+        if cfg is None:
+            print(f"! {label:16} unreadable or not JSON — skipping")
+            continue
+        servers = cfg.setdefault(key, {})
+
+        todo = []
+        for name, spath in SERVERS.items():
+            want = entry(spath)
+            have = servers.get(name)
+            if a.remove:
+                if have:
+                    todo.append(("remove", name))
+            elif have != want:
+                todo.append(("add" if not have else "update", name))
+
+        if not todo:
+            print(f"✓ {label:16} already up to date")
+            continue
+
+        actions = ", ".join(f"{op} {n}" for op, n in todo)
+        if not a.apply:
+            print(f"→ {label:16} would {actions}")
+            changed_any = True
+            continue
+
+        b = backup(path)
+        for op, name in todo:
+            if op == "remove":
+                servers.pop(name, None)
+            else:
+                servers[name] = entry(SERVERS[name])
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh, indent=2)
+            fh.write("\n")
+        print(f"✓ {label:16} {actions}")
+        print(f"    backup: {os.path.basename(b)}")
+        changed_any = True
+
+    if not a.apply and changed_any:
+        print("\nDry run. Re-run with --apply to write these changes.")
+    elif a.apply:
+        print("\nRestart your MCP host to pick up the new servers.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

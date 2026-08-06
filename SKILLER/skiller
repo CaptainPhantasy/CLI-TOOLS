@@ -1,0 +1,1182 @@
+#!/usr/bin/env python3
+"""SKILLER — vague ask in, exact skill out.
+
+Describe what you're trying to do, however roughly; SKILL-SCOUT (GLM-4.5)
+deduces what you actually need, hunts through every skill library on this
+machine, and returns one complete, ready-to-use SKILL.md on your clipboard.
+
+    skiller "make my agent stop forgetting stuff between sessions"
+    skiller index              rebuild the local skill index
+    skiller search <term>      quick local search of the index
+    skiller info               engine, index stats, catalog source
+    skiller --help             usage
+
+Zero dependencies. macOS clipboard via pbcopy. Provider config shared with
+qglm (~/.qglm.yaml / QGLM_API_KEY); model defaults to glm-4.7-flash
+(override: SKILLER_MODEL).
+"""
+
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import textwrap
+import time
+import urllib.error
+import urllib.request
+
+# ---------------------------------------------------------------- constants
+
+# "skiller" in TheDraw font "Boner Purple" (patorjk.com/software/taag,
+# rendered from tdf-chunk-04.tdf)
+HERO = r"""
+ ▄▀▀▀▀▀▀▀▀█  █▀▀█   █▀▀█  █▀▀█  █▀▀█         █▀▀█          ▄▀▀▀▀▀▀▀▀█  █▀▀▀▀▀▀▀▀▄
+█   ▄▄▄▄▄▄█  █  █   █  █  █  █  █  █         █  █         █  █▄▄▄▄▄▄█  █  ▄▄▄▄   █
+█  ▀▄▄▄▄     █  █▄▄▄▀  █  █  █  █  █         █  █         █  █▄▄▄▄▄    █  █▄▄▄▀  █
+ ▀▄     ▀▄   ▀        ▄   ▀  ▄  ▀  ▀         ▀  ▀         ▀       █    ▀        ▄
+   ▀▀▀▀▄  █  █  █▀▀▀▄  █  █  █  █  █         █  █         █  █▀▀▀▀▀    █  █▀▀▀▄  █
+█▀▀▀▀▀▀   █  █  ▀   █  █  █  █  █  █▀▀▀▀▀▀█  █  █▀▀▀▀▀▀█  █  █▀▀▀▀▀▀█  █  █   █  █
+█▄▄▄▄▄▄▄▄▀   █▄▄█   ▄▄▄█  █▄▄█   ▀▄▄▄▄▄▄▄▄█   ▀▄▄▄▄▄▄▄▄█   ▀▄▄▄▄▄▄▄▄█  █▄▄█   █▄▄█
+""".strip("\n")
+
+# light → deep teal ramp, one shade per hero row (256-color)
+TEAL_RAMP = (159, 123, 87, 51, 44, 37, 30)
+
+TAGLINE = "vague ask in · exact skill out — powered by SKILL-SCOUT on GLM"
+
+HOME = os.path.expanduser("~")
+
+DOT_DIRS = """
+.abacusai .accio .agent-browser .agent-deck .agent-sessions .agents .aider
+.aider-desk .aitk .anaconda .android .anvil-native-host .anydesk .app-store
+.atl .aws .azad .bash_sessions .bg-shell .biome .browseros .bun .cache
+.cagent .cargo .casper .chelper .claude .claude-server-commander
+.claude-server-commander-logs .claude-worktrees .cline .cocoapods .codebuddy
+.codegpt .codeium .codellm .codemaker .codex .codexbar .commandcode
+.composio .conda .config .context-singularity-mcp .continue .copilot
+.crewai .crush .cups .cursem-backup .cursor .deepseek .deerflow-bridge
+.deerflow-zen .desktop-commander .desktop-commander-device .devhub
+.display-repair .docker .electron-gyp .elevenlabs .exo .expo .factory
+.factory.bak .fastlane .floyd .floyd-10x .floyd-console .floyd-creative
+.floyd-cursem .floyd-ff .floyd-forensic .floyd-fork .floyd-logs .floyd-pids
+.floyd-superfloyd .floyd-test .floyd-time-capsule .floyd.backup .fly .forge
+.gem .gemini-for-macos .github-copilot-cli .gnupg .governance_pulse .grok
+.gsd .gsutil .harness .hermes .hf-cli .hindsight .homebrew .idlerc .ipython
+.iterm2 .jcode .jupyter .kilocode .kimi .kimi-code .kiro .kode .kombai
+.kombai-binaries .kube .legacy-oracle .lgcy .livekit .lmstudio .local
+.marscode .matplotlib .mavis .mcp-auth .mcpjam .memory .minimax-agent
+.mouthpeace .moxby .msf4 .mux .mywhisper .net .ngrok .novel-concepts-mcp
+.npm .nvm .ohmyfloyd .ollama .omega-agi-mcp .omf-auto .omlx .omp
+.openclaw_backups .openclaw-dev .openclaw-test .openclaw.pre-migration
+.opencode .openhands .openwork .orbstack .pattern-crystallizer-mcp
+.pdf-filler-profiles .pdf-toolkit-files .pg0 .pi .pi-lens .pipali .planning
+.pnpm-state .prompter .pulse .qglm .qoder-cn .qwen .railway .redocly
+.rest-client .roo .ruff_cache .rustup .safety .serena .smithery .sonarlint
+.ssh .storm_local_cache .streamlit .streamlitforge .supabase .swiftpm
+.th-client .thumbnails .tmp-playwright .tmux .trae .trae-aicc .trae-cn
+.venv .vibe .vibebox .vim .vnc .vscode .vscode-react-native .warp .wine
+.wsdash .zai .zcode .zen .zencoder .zlaude .zsh_sessions
+""".split()
+
+STAGING_ROOT = "/Volumes/applebottom/live-caches/codex-marketplace-staging"
+CURATED_INDEX_DIR = os.path.join(STAGING_ROOT, "agent-skills-index")
+
+# ---- global (machine-wide) install ----------------------------------
+# Shared state lives outside any one home directory so every account on
+# this machine reads the same index and catalog. Per-user history and
+# config still live in ~/.skiller so accounts don't collide.
+SHARED_HOME = os.environ.get("SKILLER_SHARED_HOME", "/usr/local/share/skiller")
+SKILLER_HOME = os.path.join(HOME, ".skiller")
+
+# Machine-wide skill locations that belong to no single user.
+SHARED_SKILL_DIRS = [
+    os.path.join(SHARED_HOME, "skills"),
+    "/usr/local/share/agent-skills",
+    "/opt/agent-skills",
+    "/Users/Shared/agent-skills",
+    "/Users/Shared/skills",
+]
+
+# Index: prefer the shared one; fall back to per-user if shared is
+# absent or unwritable (e.g. non-admin account rebuilding privately).
+SHARED_INDEX_PATH = os.path.join(SHARED_HOME, "index.json")
+USER_INDEX_PATH = os.path.join(SKILLER_HOME, "index.json")
+
+
+def _writable(path):
+    """True if we could create/replace `path` (checks nearest parent)."""
+    d = path if os.path.isdir(path) else os.path.dirname(path)
+    while d and not os.path.isdir(d):
+        d = os.path.dirname(d)
+    return bool(d) and os.access(d, os.W_OK)
+
+
+def index_read_path():
+    """Newest readable index: shared wins unless a user one is fresher."""
+    cands = [p for p in (SHARED_INDEX_PATH, USER_INDEX_PATH)
+             if os.path.isfile(p)]
+    if not cands:
+        return SHARED_INDEX_PATH
+    if len(cands) == 1:
+        return cands[0]
+    return max(cands, key=lambda p: os.path.getmtime(p))
+
+
+def index_write_path():
+    """Write shared when permitted, else fall back to this user's dir."""
+    if _writable(SHARED_INDEX_PATH):
+        return SHARED_INDEX_PATH
+    return USER_INDEX_PATH
+
+
+INDEX_PATH = index_read_path()
+HISTORY_DIR = os.path.join(SKILLER_HOME, "skills")
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+
+DEFAULT_MODEL = "glm-4.7-flash"   # free tier on coding endpoint; see PRICING below
+
+# $/1M tokens (input, cached input, output) — z.ai pricing 2026-07
+PRICING = {
+    "glm-4.7-flash": (0.0, 0.0, 0.0),
+    "glm-4.5-flash": (0.0, 0.0, 0.0),
+    "glm-4.7": (0.6, 0.11, 2.2),
+    "glm-4.6": (0.6, 0.11, 2.2),
+    "glm-4.5": (0.6, 0.11, 2.2),
+    "glm-4.5-air": (0.2, 0.03, 1.1),
+    "glm-4-32b-0414-128k": (0.1, None, 0.1),
+}
+MAX_SELECTED = 4          # skills fed to the composer
+MAX_SKILL_CHARS = 15000   # per-skill content cap for the composer
+CATALOG_CAP = 700         # catalog entries sent to SKILL-SCOUT
+
+# ---------------------------------------------------------------- prompts
+
+SCOUT_SYSTEM = """<identity>
+You are SKILL-SCOUT, an elite skill librarian for a power user's machine.
+You read vague, rushed, often inadequate requests and deduce what the user
+is actually trying to accomplish. You never take a rough prompt at face
+value: you infer the latent goal behind it, then match that goal to the
+best skills in the catalog.
+</identity>
+
+<deduction_method>
+Work through these steps, in order, before selecting anything:
+1. Literal read - what the words say.
+2. Latent goal - what outcome the user most plausibly wants. Typos,
+   missing words, and shorthand are normal; resolve them charitably.
+   Consider: what artifact would the user paste this skill into an agent
+   to produce? What pain triggered the request?
+3. Signals - extract domain nouns, verbs, file types, tool names, and any
+   workflow stage implied (build, test, deploy, research, automate,
+   review, document, monitor).
+4. Coverage check - decide which catalog skills serve the latent goal.
+   Prefer a skill that solves the WHOLE goal over one matching a single
+   keyword. Prefer specific over generic when both match.
+5. Mode - "use" when one skill already fits as-is; "adapt" when the best
+   match needs tailoring or two or more skills must be merged;
+   "synthesize" when nothing in the catalog serves the latent goal and a
+   new skill must be written from scratch.
+</deduction_method>
+
+<rules>
+Select at most 4 skills, best first, using their exact catalog names.
+Select only names that appear in the catalog.
+When the request is ambiguous between two goals, pick the more probable
+one and record the alternative in "alternate_reading".
+Base "interpreted_need" on what the user wants to ACCOMPLISH, phrased as
+one concrete sentence.
+</rules>
+
+<output_contract>
+Reply with a single JSON object, no prose, no markdown fences:
+{
+  "interpreted_need": "one concrete sentence",
+  "alternate_reading": "second-most-likely reading, or null",
+  "signals": ["extracted", "keywords"],
+  "selected_skills": ["exact-catalog-name", "..."],
+  "mode": "use" | "adapt" | "synthesize",
+  "reasoning": "2-3 sentences on why these skills serve the latent goal"
+}
+</output_contract>"""
+
+SMITH_SYSTEM = """<identity>
+You are SKILL-SMITH, an expert author of agent skills (SKILL.md files).
+You turn a deduced user need plus source skills into ONE complete,
+self-contained, immediately usable skill.
+</identity>
+
+<skill_format>
+A skill is a markdown document that starts with YAML frontmatter:
+---
+name: kebab-case-name
+description: One or two sentences stating what the skill does and exactly
+  when an agent should invoke it (trigger phrases help).
+---
+followed by the body: clear step-by-step instructions an AI agent follows
+to perform the capability. Good bodies state the goal, the procedure,
+concrete commands or patterns to use, edge cases, and how to verify the
+result. The skill must stand alone - no references to files that only
+existed in the source skill's repository unless you keep them with full
+absolute paths that plausibly exist.
+</skill_format>
+
+<rules>
+Serve the interpreted need exactly - not the source skills' original scope.
+In "adapt" mode: merge the strongest parts of the sources, cut anything
+irrelevant to the need, and rewrite so the result reads as one voice.
+In "use" mode: deliver the source skill, lightly cleaned, with its name
+and description sharpened for the need.
+In "synthesize" mode: write the skill from scratch following best
+practice for the domain.
+Keep the body focused and actionable - target 60-200 lines. State
+verification steps near the end.
+Positive framing: say what TO do.
+</rules>
+
+<output_contract>
+Output ONLY the complete SKILL.md content, starting with the --- of the
+frontmatter. No commentary before or after. No outer markdown fences.
+</output_contract>"""
+
+# ---------------------------------------------------------------- color
+
+def _tty() -> bool:
+    return sys.stdout.isatty() and "NO_COLOR" not in os.environ
+
+
+class C:
+    on = _tty()
+
+    @classmethod
+    def _c(cls, code: str, s: str) -> str:
+        return f"\033[{code}m{s}\033[0m" if cls.on else s
+
+    @classmethod
+    def frame(cls, s):  return cls._c("38;5;37", s)     # teal
+    @classmethod
+    def hero(cls, s):   return cls._c("1;38;5;51", s)   # bold cyan
+    @classmethod
+    def title(cls, s):  return cls._c("1;38;5;15", s)   # bold white
+    @classmethod
+    def dim(cls, s):    return cls._c("38;5;245", s)    # grey
+    @classmethod
+    def key(cls, s):    return cls._c("38;5;114", s)    # green
+    @classmethod
+    def ok(cls, s):     return cls._c("1;38;5;114", s)  # bold green
+    @classmethod
+    def warn(cls, s):   return cls._c("1;38;5;214", s)  # orange
+    @classmethod
+    def body(cls, s):   return cls._c("38;5;252", s)    # near-white
+    @classmethod
+    def teal(cls, s):   return cls._c("38;5;80", s)     # soft teal
+
+
+ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def visible_len(s: str) -> int:
+    return len(ANSI_RE.sub("", s))
+
+
+def clip_ansi(s: str, maxlen: int) -> str:
+    if visible_len(s) <= maxlen:
+        return s
+    out, count, i = [], 0, 0
+    while i < len(s) and count < maxlen:
+        m = ANSI_RE.match(s, i)
+        if m:
+            out.append(m.group(0))
+            i = m.end()
+        else:
+            out.append(s[i])
+            count += 1
+            i += 1
+    out.append("\033[0m" if C.on else "")
+    return "".join(out)
+
+
+# ---------------------------------------------------------------- framing
+
+def term_width() -> int:
+    cols = shutil.get_terminal_size(fallback=(100, 24)).columns
+    return max(74, min(cols, 100))
+
+
+def frame(lines, title=None, footer=None, width=None, pad=2):
+    w = width or term_width()
+    inner = w - 2 - 2 * pad
+    out = []
+    if title:
+        out.append(C.frame("╭──") + C.title(f" {title} ") +
+                   C.frame("─" * max(0, w - 6 - len(title)) + "╮"))
+    else:
+        out.append(C.frame("╭" + "─" * (w - 2) + "╮"))
+    for ln in lines:
+        ln = clip_ansi(ln, inner)
+        gap = inner - visible_len(ln)
+        out.append(C.frame("│") + " " * pad + ln + " " * max(0, gap) +
+                   " " * pad + C.frame("│"))
+    if footer:
+        out.append(C.frame("╰" + "─" * max(0, w - 6 - len(footer))) +
+                   C.dim(f" {footer} ") + C.frame("──╯"))
+    else:
+        out.append(C.frame("╰" + "─" * (w - 2) + "╯"))
+    return "\n".join(out)
+
+
+def wrap_block(text: str, width: int):
+    lines = []
+    for raw in text.split("\n"):
+        if not raw.strip():
+            lines.append("")
+            continue
+        indent = " " * (len(raw) - len(raw.lstrip()))
+        wrapped = textwrap.wrap(
+            raw.strip(), width=max(10, width - len(indent)),
+            break_long_words=False, break_on_hyphens=False,
+        ) or [""]
+        lines.extend(indent + w for w in wrapped)
+    return lines
+
+
+def hero_block(width: int):
+    cols = shutil.get_terminal_size(fallback=(100, 24)).columns
+    lines = HERO.split("\n")
+    hero_w = max(len(l) for l in lines)
+    center = max(width, hero_w) if cols >= hero_w else width
+    out = []
+    if cols >= hero_w:
+        for i, l in enumerate(lines):
+            shade = TEAL_RAMP[min(i, len(TEAL_RAMP) - 1)]
+            colored = (f"\033[1;38;5;{shade}m{l.rstrip()}\033[0m"
+                       if C.on else l.rstrip())
+            out.append(" " * max(0, (center - hero_w) // 2) + colored)
+    else:
+        out.append(" " * max(0, (width - 11) // 2) + C.hero("≡ SKILLER ≡"))
+    tag = TAGLINE
+    out.append(" " * max(0, (center - len(tag)) // 2) + C.dim(tag))
+    return "\n".join(out)
+
+
+def stat_line(label, value, width):
+    room = max(8, width - 14)
+    if len(value) > room:
+        value = value[: room - 1] + "…"
+    return C.key(f"{label:<14}") + C.body(value)
+
+
+# ---------------------------------------------------------------- config
+
+def load_config():
+    cfg = {
+        "endpoint": "https://api.z.ai/api/coding/paas/v4/chat/completions",
+        "api_key": "",
+        "model": DEFAULT_MODEL,
+        "timeout": 600,
+    }
+    # Per-user config wins; a shared machine-wide config is the fallback
+    # so every account on this box works without its own setup.
+    for path in (os.path.join(HOME, ".qglm.yaml"),
+                 os.path.join(SHARED_HOME, "qglm.yaml")):
+        if cfg["api_key"]:
+            break
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    m = re.match(r"\s*(api_key|endpoint)\s*:\s*(.+)", line)
+                    if m:
+                        cfg[m.group(1)] = m.group(2).strip().strip("'\"")
+        except OSError:
+            continue
+    cfg["api_key"] = os.environ.get("QGLM_API_KEY", cfg["api_key"])
+    cfg["endpoint"] = os.environ.get("QGLM_ENDPOINT", cfg["endpoint"])
+    cfg["model"] = os.environ.get("SKILLER_MODEL", cfg["model"])
+    cfg["thinking"] = os.environ.get("SKILLER_THINKING", "disabled")
+    return cfg
+
+
+# ---------------------------------------------------------------- indexing
+
+def user_homes():
+    """Every real home directory on this machine, current user first.
+
+    A global install indexes skills belonging to all accounts, not just
+    whoever happens to be running the command. Homes we can't read are
+    dropped silently (find/fd would just error on them anyway)."""
+    homes = [HOME]
+    for base in ("/Users", "/home"):
+        try:
+            names = sorted(os.listdir(base))
+        except OSError:
+            continue
+        for name in names:
+            if name.startswith(".") or name == "Shared":
+                continue
+            p = os.path.join(base, name)
+            if os.path.isdir(p) and p not in homes and os.access(p, os.R_OK):
+                homes.append(p)
+    return homes
+
+
+def skill_roots():
+    roots = []
+    for home in user_homes():
+        roots += [os.path.join(home, d) for d in DOT_DIRS]
+    roots.append(STAGING_ROOT)
+    roots += [r for r in SHARED_SKILL_DIRS if r]
+    extra = os.environ.get("SKILLER_ROOTS", "")
+    roots += [r for r in extra.split(":") if r]
+    seen, uniq = set(), []
+    for r in roots:
+        if r not in seen and os.path.isdir(r):
+            seen.add(r)
+            uniq.append(r)
+    return uniq
+
+
+def find_skill_files(roots, progress=None):
+    fd = shutil.which("fd")
+    files = []
+    for i, root in enumerate(roots):
+        if progress:
+            progress(f"scanning {os.path.basename(root) or root} "
+                     f"({i + 1}/{len(roots)}) · {len(files):,} found")
+        try:
+            if fd:
+                out = subprocess.run(
+                    [fd, "-H", "-I", "--max-depth", "8", "-g", "SKILL.md",
+                     ".", root],
+                    capture_output=True, text=True, timeout=240)
+            else:
+                out = subprocess.run(
+                    ["find", root, "-maxdepth", "8", "-name", "SKILL.md",
+                     "-type", "f"],
+                    capture_output=True, text=True, timeout=240)
+            files.extend(l for l in out.stdout.splitlines() if l.strip())
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+    return files
+
+
+FRONT_RE = re.compile(r"^---\s*\n(.*?)\n---", re.S)
+
+
+def parse_skill_head(path):
+    """Return (name, description) from frontmatter or content heuristics."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return None
+    name = desc = ""
+    m = FRONT_RE.match(head)
+    if m:
+        block = m.group(1)
+        nm = re.search(r"^name:\s*(.+)$", block, re.M)
+        if nm:
+            name = nm.group(1).strip().strip("'\"")
+        dm = re.search(r"^description:\s*(.*)$", block, re.M)
+        if dm:
+            desc = dm.group(1).strip().strip("'\"")
+            if desc in ("|", ">", "|-", ">-"):
+                desc_lines = []
+                for line in block[dm.end():].split("\n"):
+                    if line.startswith((" ", "\t")) and line.strip():
+                        desc_lines.append(line.strip())
+                    elif desc_lines:
+                        break
+                desc = " ".join(desc_lines)
+    if not name:
+        name = os.path.basename(os.path.dirname(path)) or "unnamed"
+    if not desc:
+        h = re.search(r"^#\s+(.+)$", head, re.M)
+        desc = h.group(1).strip() if h else ""
+    return name, " ".join(desc.split())[:300]
+
+
+def build_index(progress=None):
+    roots = skill_roots()
+    files = find_skill_files(roots, progress)
+    skills = {}          # content-hash -> entry
+    seen_names = {}      # name -> hash (newest mtime wins)
+    for i, path in enumerate(files):
+        if progress and i % 500 == 0:
+            progress(f"parsing {i:,}/{len(files):,} skill files")
+        parsed = parse_skill_head(path)
+        if not parsed:
+            continue
+        name, desc = parsed
+        try:
+            st = os.stat(path)
+            with open(path, "rb") as fh:
+                digest = hashlib.sha1(fh.read()).hexdigest()[:16]
+        except OSError:
+            continue
+        entry = skills.get(digest)
+        if entry:
+            entry["copies"] += 1
+            if len(path) < len(entry["path"]):
+                entry["path"] = path
+            continue
+        skills[digest] = {"name": name, "desc": desc, "path": path,
+                          "mtime": st.st_mtime, "copies": 1}
+    # collapse same-name different-content: newest mtime is primary,
+    # older variants are kept but suffixed so they stay selectable
+    by_name = {}
+    for digest, e in skills.items():
+        cur = by_name.get(e["name"])
+        if cur is None or e["mtime"] > cur["mtime"]:
+            by_name[e["name"]] = e
+    entries = []
+    for e in skills.values():
+        primary = by_name[e["name"]] is e
+        entries.append({**e, "primary": primary})
+    index = {
+        "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "roots_scanned": len(roots),
+        "files_seen": len(files),
+        "unique_skills": len(by_name),
+        "entries": sorted(entries, key=lambda e: e["name"]),
+    }
+    global INDEX_PATH
+    out_path = index_write_path()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    tmp = out_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(index, fh)
+    os.replace(tmp, out_path)
+    if out_path == SHARED_INDEX_PATH:
+        # every account must be able to read the shared index
+        try:
+            os.chmod(out_path, 0o644)
+        except OSError:
+            pass
+    INDEX_PATH = out_path
+    return index
+
+
+def load_index(auto_build=True):
+    global INDEX_PATH
+    INDEX_PATH = index_read_path()
+    try:
+        with open(INDEX_PATH, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        if not auto_build:
+            return None
+        live = sys.stderr.isatty()
+
+        def progress(msg):
+            if live:
+                sys.stderr.write("\r  ◈ " + msg[:70].ljust(72))
+                sys.stderr.flush()
+        sys.stderr.write("  first run — building the skill index "
+                         "(one-time, a few minutes)\n")
+        idx = build_index(progress)
+        if live:
+            sys.stderr.write("\r" + " " * 78 + "\r")
+        return idx
+
+
+def primary_entries(index):
+    return [e for e in index["entries"] if e.get("primary")]
+
+
+def curated_catalog():
+    """Compressed category → skill-name catalog from Douglas's curated
+    agent-skills-index (12 category docs), or a user override file."""
+    override = os.environ.get(
+        "SKILLER_CATALOG",
+        next((p for p in (
+            os.path.join(SKILLER_HOME, "catalog.md"),
+            os.path.join(SHARED_HOME, "catalog.md"),
+            os.path.join(SCRIPT_DIR, "skills-catalog.md"),
+        ) if os.path.isfile(p)), ""))
+    if override:
+        try:
+            with open(override, encoding="utf-8") as fh:
+                return fh.read()[:120000], override
+        except OSError:
+            pass
+    if not os.path.isdir(CURATED_INDEX_DIR):
+        return "", ""
+    sections = []
+    try:
+        cat_files = sorted(
+            f for f in os.listdir(CURATED_INDEX_DIR)
+            if re.match(r"\d\d-.*\.md$", f) and not f.startswith("00"))
+    except OSError:
+        return "", ""
+    for fname in cat_files:
+        try:
+            with open(os.path.join(CURATED_INDEX_DIR, fname),
+                      encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        title_m = re.search(r"^#\s+Agent Skills Index\s+—\s+(.+)$",
+                            text, re.M)
+        title = title_m.group(1) if title_m else fname[3:-3]
+        names = re.findall(r"^##\s+(.+)$", text, re.M)
+        names = [n.strip() for n in names if not n.lower().startswith(
+            ("agent skills", "generated", "notes"))]
+        if names:
+            sections.append(f"### {title}\n" + ", ".join(names))
+    return "\n\n".join(sections), CURATED_INDEX_DIR
+
+
+def catalog_for(index, query):
+    """Catalog in two parts: a STABLE prefix (identical bytes on every
+    run, so z.ai's implicit prompt cache serves it at half price) and a
+    small query-relevant tail. Query text itself comes last."""
+    entries = primary_entries(index)
+    curated, _src = curated_catalog()
+
+    def line(e, desc_len):
+        return (f'- {e["name"]} — {e["desc"][:desc_len]}' if e["desc"]
+                else f'- {e["name"]}')
+
+    # stable prefix: curated categories + deterministic top slice
+    # (most-copied first ≈ most-installed, then alphabetical)
+    stable_pick = sorted(entries,
+                         key=lambda e: (-e.get("copies", 1), e["name"]))
+    stable = "\n".join(line(e, 110) for e in
+                       sorted(stable_pick[:CATALOG_CAP],
+                              key=lambda e: e["name"]))
+
+    # query tail: top matches by keyword affinity, descriptions included
+    words = set(re.findall(r"[a-z0-9]{3,}", query.lower()))
+
+    def score(e):
+        hay = (e["name"] + " " + e["desc"]).lower()
+        return sum(1 for w in words if w in hay)
+    relevant = [e for e in sorted(entries,
+                                  key=lambda e: (-score(e), e["name"]))
+                if score(e) > 0][:150]
+    tail = "\n".join(line(e, 140) for e in relevant)
+
+    parts = []
+    if curated:
+        parts.append("CURATED CATEGORIZED INDEX (category → skill "
+                     "names):\n" + curated)
+    parts.append("SKILL CATALOG (name — description):\n" + stable)
+    if tail:
+        parts.append("MOST RELEVANT TO THIS REQUEST (name — "
+                     "description):\n" + tail)
+    return "\n\n".join(parts)
+
+
+def resolve_skills(index, names):
+    """Map SKILL-SCOUT's chosen names to index entries."""
+    entries = index["entries"]
+    primaries = {e["name"]: e for e in entries if e.get("primary")}
+    out = []
+    for n in names[:MAX_SELECTED]:
+        e = primaries.get(n)
+        if e is None:
+            low = n.lower()
+            cands = [x for x in entries
+                     if x.get("primary") and low in x["name"].lower()]
+            e = min(cands, key=lambda x: len(x["name"])) if cands else None
+        if e and e not in out:
+            out.append(e)
+    return out
+
+
+# ---------------------------------------------------------------- clipboard
+
+def clipboard_copy(text: str) -> bool:
+    try:
+        proc = subprocess.run(["pbcopy"], input=text.encode("utf-8"),
+                              timeout=10)
+        return proc.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+# ---------------------------------------------------------------- GLM call
+
+def call_glm(cfg, messages, temperature, max_tokens, label):
+    payload = {
+        "model": cfg["model"],
+        "messages": messages,
+        "temperature": temperature,
+        "top_p": 0.9,
+        "max_tokens": max_tokens,
+        "stream": True,
+        # GLM-4.5 thinking phase costs ~50s per call for little gain on
+        # catalog matching; measured 55.6s -> 2.3s on this endpoint
+        "thinking": {"type": cfg.get("thinking", "disabled")},
+    }
+    req = urllib.request.Request(
+        cfg["endpoint"],
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {cfg['api_key']}"})
+    chunks = []
+    usage = {}
+    served = None
+    start = time.time()
+    last_draw = 0.0
+    spinner = "◢◣◤◥"
+    live = sys.stderr.isatty()
+    try:
+        with urllib.request.urlopen(req, timeout=cfg["timeout"]) as resp:
+            for i, raw in enumerate(resp):
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(data)
+                    delta = obj["choices"][0].get("delta", {})
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    continue
+                if obj.get("usage"):
+                    usage = obj["usage"]
+                if obj.get("model"):
+                    served = obj["model"]
+                content = delta.get("content") or ""
+                if content:
+                    chunks.append(content)
+                now = time.time()
+                if live and now - last_draw >= 0.15:
+                    last_draw = now
+                    n = sum(len(c) for c in chunks)
+                    sys.stderr.write(
+                        f"\r  {spinner[i % 4]} {label}… "
+                        f"{n:,} chars · {now - start:.0f}s ")
+                    sys.stderr.flush()
+    finally:
+        if live:
+            sys.stderr.write("\r" + " " * 70 + "\r")
+            sys.stderr.flush()
+    if served:
+        usage["_served"] = served
+    return "".join(chunks), time.time() - start, usage
+
+
+def merge_usage(*usages):
+    """Sum token usage across calls into one telemetry dict."""
+    tot = {"prompt": 0, "cached": 0, "out": 0, "cache_supported": False}
+    for u in usages:
+        if not u:
+            continue
+        tot["prompt"] += u.get("prompt_tokens", 0)
+        det = u.get("prompt_tokens_details")
+        if det is not None:
+            tot["cache_supported"] = True
+            tot["cached"] += det.get("cached_tokens", 0)
+        tot["out"] += u.get("completion_tokens", 0)
+    return tot
+
+
+def telemetry_line(tot, model=""):
+    """One-line cache/token telemetry with real z.ai pricing."""
+    if not tot["prompt"]:
+        return C.dim(" telemetry unavailable (no usage in stream)")
+    pct = 100.0 * tot["cached"] / tot["prompt"]
+    price = PRICING.get(model.lower())
+    if tot["cached"]:
+        cache_part = C.ok(f'{tot["cached"]:,} cached ({pct:.0f}%)')
+    elif tot["cache_supported"]:
+        cache_part = C.dim("0 cached (cold)")
+    else:
+        cache_part = C.dim("cache n/a for this model")
+    if price and price[0] == 0.0:
+        note = "  →  free tier ✦"
+    elif price and tot["cached"] and price[1] is not None:
+        full = tot["prompt"] * price[0] + tot["out"] * price[2]
+        real = ((tot["prompt"] - tot["cached"]) * price[0]
+                + tot["cached"] * price[1] + tot["out"] * price[2])
+        note = (f'  →  ${real / 1e6:.4f} '
+                f'(cache saved {100 * (1 - real / full):.0f}%)')
+    elif price:
+        cost = tot["prompt"] * price[0] + tot["out"] * price[2]
+        note = f'  →  ${cost / 1e6:.4f}'
+    else:
+        note = ""
+    return (C.dim(" tokens  ") + C.body(f'{tot["prompt"]:,} in') +
+            C.dim(" · ") + cache_part +
+            C.dim(" · ") + C.body(f'{tot["out"]:,} out') + C.dim(note))
+
+
+def parse_json_reply(text):
+    cleaned = text.strip()
+    m = re.search(r"```(?:json)?\s*(.*?)```", cleaned, re.S)
+    if m:
+        cleaned = m.group(1).strip()
+    start = cleaned.find("{")
+    if start == -1:
+        return None
+    for end in range(len(cleaned), start, -1):
+        try:
+            obj = json.loads(cleaned[start:end])
+            return obj if isinstance(obj, dict) else None
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def strip_fences(text):
+    t = text.strip()
+    m = re.match(r"^```[a-zA-Z]*\s*\n(.*)\n```$", t, re.S)
+    return m.group(1).strip() if m else t
+
+
+# ---------------------------------------------------------------- views
+
+def api_error_frame(exc, inner):
+    if isinstance(exc, urllib.error.HTTPError):
+        detail = exc.read().decode("utf-8", "replace")[:300]
+        return frame(
+            [C.warn(" ✘ ") + C.title(f"GLM API error {exc.code}"), ""]
+            + [C.dim(l) for l in wrap_block(detail, inner)], title="error")
+    return frame([C.warn(" ✘ ") + C.title("Could not reach GLM"),
+                  C.dim(str(exc))], title="error")
+
+
+def view_fetch(query, opts):
+    w = term_width()
+    inner = w - 6
+    cfg = load_config()
+    if not cfg["api_key"]:
+        print(frame(
+            [C.warn(" ✘ ") + C.title("No GLM API key found"),
+             "",
+             C.key("  export QGLM_API_KEY=") + C.dim("\"your-key\""),
+             C.key("  api_key: ") + C.dim("… in ~/.qglm.yaml")],
+            title="config"))
+        return 1
+
+    print()
+    print(hero_block(w))
+    print()
+
+    index = load_index()
+    n_unique = index.get("unique_skills", len(primary_entries(index)))
+    print(frame(
+        [stat_line("Ask", query, inner),
+         stat_line("Library", f'{n_unique:,} unique skills '
+                   f'({index["files_seen"]:,} files scanned)', inner),
+         stat_line("Engine", cfg["model"], inner)],
+        title="hunt", footer="SKILL-SCOUT is deducing your need"))
+    print()
+
+    # ---- stage 1: deduction + selection
+    catalog = catalog_for(index, query)
+    scout_messages = [
+        {"role": "system", "content": SCOUT_SYSTEM},
+        {"role": "user", "content":
+         catalog + "\n\nUSER REQUEST (may be vague or inadequate):\n"
+         + query + "\n\nDeduce the latent need and select skills. "
+         "JSON only."},
+    ]
+    try:
+        reply, t1, usage1 = call_glm(cfg, scout_messages, 0.1, 2500,
+                                     "deducing")
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        print(api_error_frame(exc, inner))
+        return 1
+    scout = parse_json_reply(reply)
+    if not scout or "interpreted_need" not in scout:
+        print(frame([C.warn(" ✘ ") +
+                     C.title("Scout reply was not parseable")]
+                    + [C.dim(l) for l in wrap_block(reply[:400], inner)],
+                    title="error"))
+        return 1
+
+    picked = resolve_skills(index, scout.get("selected_skills") or [])
+    mode = scout.get("mode", "adapt" if picked else "synthesize")
+    if not picked:
+        mode = "synthesize"
+
+    ded = [C.teal("Interpreted need")]
+    ded += [C.body(l) for l in
+            wrap_block(scout["interpreted_need"], inner)]
+    if scout.get("alternate_reading"):
+        ded.append("")
+        ded += [C.dim(l) for l in wrap_block(
+            "also considered: " + str(scout["alternate_reading"]), inner)]
+    ded.append("")
+    ded.append(C.teal(f"Sources ({mode})"))
+    if picked:
+        for e in picked:
+            ded.append(C.key("  • " + e["name"]) +
+                       C.dim(f'  ({e["copies"]} cop'
+                             f'{"y" if e["copies"] == 1 else "ies"})'))
+            ded.extend(C.dim("    " + l) for l in
+                       wrap_block(e["path"], inner - 4)[:1])
+    else:
+        ded.append(C.dim("  none fit — writing this skill from scratch"))
+    print(frame(ded, title="deduction", footer=f"{t1:.0f}s"))
+    print()
+
+    # ---- stage 2: composition
+    sources = []
+    for e in picked:
+        try:
+            with open(e["path"], encoding="utf-8", errors="replace") as fh:
+                content = fh.read(MAX_SKILL_CHARS)
+        except OSError:
+            continue
+        sources.append(f'<source_skill name="{e["name"]}" '
+                       f'path="{e["path"]}">\n{content}\n</source_skill>')
+    smith_user = (
+        "\n\n".join(sources) +
+        ("\n\n" if sources else "") +
+        "INTERPRETED NEED:\n" + scout["interpreted_need"] +
+        "\n\nORIGINAL REQUEST (for tone/context):\n" + query +
+        f"\n\nMODE: {mode}" +
+        "\n\nProduce the complete SKILL.md now.")
+    smith_messages = [
+        {"role": "system", "content": SMITH_SYSTEM},
+        {"role": "user", "content": smith_user},
+    ]
+    try:
+        skill_text, t2, usage2 = call_glm(cfg, smith_messages, 0.2, 8000,
+                                          "forging")
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        print(api_error_frame(exc, inner))
+        return 1
+    skill_text = strip_fences(skill_text)
+    if not skill_text.startswith("---"):
+        cut = skill_text.find("---")
+        if 0 < cut < 200:
+            skill_text = skill_text[cut:]
+
+    nm = re.search(r"^name:\s*(.+)$", skill_text, re.M)
+    skill_name = (nm.group(1).strip() if nm else "skill")
+
+    served = usage2.get("_served") or usage1.get("_served")
+    engine = (f"{cfg['model']} → {served}"
+              if served and served != cfg["model"] else cfg["model"])
+    saved = save_history(skill_name, skill_text)
+    body = [C.body(l) for l in
+            wrap_block(skill_text, inner)[:opts.get("preview", 32)]]
+    total_lines = len(skill_text.split("\n"))
+    if total_lines > opts.get("preview", 32):
+        body.append(C.dim(f"… {total_lines} lines total — full skill is "
+                          "on your clipboard"))
+    print(frame(body, title=f"skill · {skill_name}",
+                footer=f"{engine} · {t1 + t2:.0f}s"))
+    print()
+
+    if opts.get("copy") == "none":
+        note = C.dim(" copy skipped (--no-copy)")
+    elif clipboard_copy(skill_text):
+        note = (C.ok(" ✔ ") + C.title("Complete skill copied to clipboard")
+                + C.dim("  —  paste into any skills folder"))
+    else:
+        note = C.warn(" ✘ ") + C.title("Clipboard copy failed")
+    tail = [note]
+    if saved:
+        tail.append(C.dim(f" also saved → {saved}"))
+    tail.append(telemetry_line(merge_usage(usage1, usage2),
+                               served or cfg["model"]))
+    print(frame(tail, footer="skiller --help for more"))
+    print()
+    return 0
+
+
+def save_history(name, text):
+    try:
+        os.makedirs(HISTORY_DIR, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        safe = re.sub(r"[^a-z0-9-]", "-", name.lower())[:40]
+        path = os.path.join(HISTORY_DIR, f"{stamp}-{safe}.md")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return tilde(path)
+    except OSError:
+        return None
+
+
+def tilde(path):
+    """Shorten only this user's home; shared/global paths stay explicit."""
+    return path.replace(HOME, "~") if path.startswith(HOME) else path
+
+
+def view_index():
+    w = term_width()
+    live = sys.stderr.isatty()
+
+    def progress(msg):
+        if live:
+            sys.stderr.write("\r  ◈ " + msg[:70].ljust(72))
+            sys.stderr.flush()
+    print()
+    print(hero_block(w))
+    print()
+    start = time.time()
+    idx = build_index(progress)
+    if live:
+        sys.stderr.write("\r" + " " * 78 + "\r")
+    inner = w - 6
+    print(frame(
+        [stat_line("Roots", f'{idx["roots_scanned"]} scanned', inner),
+         stat_line("Files", f'{idx["files_seen"]:,} SKILL.md found', inner),
+         stat_line("Unique", f'{idx["unique_skills"]:,} distinct skills '
+                   f'({len(idx["entries"]):,} content variants)', inner),
+         stat_line("Took", f"{time.time() - start:.0f}s", inner),
+         stat_line("Index", tilde(INDEX_PATH), inner)],
+        title="index rebuilt"))
+    print()
+    return 0
+
+
+def view_search(term):
+    w = term_width()
+    inner = w - 6
+    index = load_index()
+    words = [t for t in re.findall(r"[a-z0-9]{2,}", term.lower())]
+    hits = []
+    for e in primary_entries(index):
+        hay = (e["name"] + " " + e["desc"]).lower()
+        s = sum(1 for t in words if t in hay)
+        if s:
+            hits.append((s, e))
+    hits.sort(key=lambda x: (-x[0], x[1]["name"]))
+    lines = []
+    for s, e in hits[:25]:
+        lines.append(C.key(e["name"]))
+        if e["desc"]:
+            lines.extend(C.dim("  " + l) for l in
+                         wrap_block(e["desc"][:160], inner - 2)[:2])
+        lines.append(C.dim("  " + tilde(e["path"])))
+    if not lines:
+        lines = [C.dim("no local matches — try `skiller \"" + term +
+                       "\"` and let SKILL-SCOUT deduce it")]
+    print()
+    print(frame(lines, title=f"search · {term}",
+                footer=f"{len(hits)} matches"))
+    print()
+    return 0
+
+
+def view_info():
+    w = term_width()
+    inner = w - 6
+    cfg = load_config()
+    index = load_index(auto_build=False)
+    print()
+    print(hero_block(w))
+    print()
+    lines = [
+        stat_line("Engine", cfg["model"], inner),
+        stat_line("Endpoint", cfg["endpoint"], inner),
+        stat_line("API key", "configured" if cfg["api_key"] else "MISSING",
+                  inner),
+        stat_line("History", tilde(HISTORY_DIR), inner),
+    ]
+    if index:
+        lines += [
+            stat_line("Index", f'{index["unique_skills"]:,} unique skills '
+                      f'· built {index["built_at"]}', inner),
+            stat_line("Coverage", f'{index["roots_scanned"]} roots · '
+                      f'{index["files_seen"]:,} files', inner),
+        ]
+    else:
+        lines.append(stat_line("Index", "not built yet — run: "
+                               "skiller index", inner))
+    curated, src = curated_catalog()
+    lines.append(stat_line(
+        "Catalog", f"curated categorized index · {src}" if curated
+        else "none (auto-generated from index) — drop a categorized "
+             "index at ~/.skiller/catalog.md", inner))
+    print(frame(lines, title="skiller info"))
+    print()
+    return 0
+
+
+def view_help():
+    w = term_width()
+    inner = w - 6
+    rows = [
+        ('skiller "…rough idea…"',
+         "deduce the real need, hunt the libraries, forge the skill"),
+        ("skiller index", "rebuild the local skill index"),
+        ("skiller search <term>", "quick local keyword search"),
+        ("skiller info", "engine, index stats, catalog source"),
+        ("skiller --no-copy \"…\"", "show the skill without copying"),
+        ("skiller --preview N \"…\"", "preview N lines (default 32)"),
+        ("skiller --think \"…\"",
+         "enable GLM-4.5 deep thinking (slower, for hard asks)"),
+    ]
+    lines = [C.title("Usage"), ""]
+    for cmd, desc in rows:
+        parts = wrap_block(desc, max(20, inner - 28))
+        lines.append(C.key(f"  {cmd:<26}") + C.body(parts[0]))
+        lines.extend(" " * 28 + C.body(p) for p in parts[1:])
+    lines += ["", C.title("How it works"), ""]
+    lines += [C.dim(l) for l in wrap_block(
+        "SKILL-SCOUT (GLM-4.5) reads your rough request, deduces the "
+        "latent goal, and picks the best matches from an index of every "
+        "SKILL.md across ~190 tool folders in your home directory plus "
+        "the codex marketplace staging cache. SKILL-SMITH then merges, "
+        "adapts, or writes from scratch — one complete SKILL.md, copied "
+        "to your clipboard and saved to ~/.skiller/skills/. Drop a "
+        "curated categorized index at ~/.skiller/catalog.md and the "
+        "scout will browse that first.", inner)]
+    print()
+    print(hero_block(w))
+    print()
+    print(frame(lines, title="help", footer="SKILLER"))
+    print()
+    return 0
+
+
+# ---------------------------------------------------------------- main
+
+def main(argv):
+    if any(a in ("-h", "--help", "help") for a in argv):
+        return view_help()
+    cmd = argv[0].lower() if argv else None
+    if cmd == "index":
+        return view_index()
+    if cmd == "search":
+        if len(argv) < 2:
+            sys.stderr.write("skiller: search needs a term\n")
+            return 2
+        return view_search(" ".join(argv[1:]))
+    if cmd == "info":
+        return view_info()
+
+    opts, words, i = {}, [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--no-copy":
+            opts["copy"] = "none"
+            i += 1
+        elif a == "--think":
+            os.environ["SKILLER_THINKING"] = "enabled"
+            i += 1
+        elif a == "--preview":
+            if i + 1 >= len(argv) or not argv[i + 1].isdigit():
+                sys.stderr.write("skiller: --preview needs a number\n")
+                return 2
+            opts["preview"] = int(argv[i + 1])
+            i += 2
+        else:
+            words.append(a)
+            i += 1
+    query = " ".join(words).strip()
+    if not query:
+        return view_help()
+    return view_fetch(query, opts)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)
+    except BrokenPipeError:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)
