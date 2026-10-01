@@ -53,7 +53,7 @@ TAGLINE = "you solved this before · find it · run it again"
 
 SHARED_HOME = os.environ.get("RECALLER_SHARED_HOME",
                              "/usr/local/share/recaller")
-USER_HOME = os.path.join(os.path.expanduser("~"), ".recaller")
+USER_HOME = os.environ.get("RECALLER_USER_HOME", os.path.join(os.path.expanduser("~"), ".recaller"))
 INDEX_NAME = "index.json"
 
 # Where each harness keeps transcripts, relative to a user's home.

@@ -24,6 +24,13 @@ const MCP = (() => {
   const pending = new Map();
   const notifyHandlers = new Map();
 
+  // MCP Apps stable (2026-08) display-mode contract state.
+  // DISPLAY_MODE is the host-applied mode (source of truth), never the last
+  // requested one. HOST_MODES is the host-advertised availableDisplayModes;
+  // empty array means "not confirmed yet" — controls stay hidden.
+  let DISPLAY_MODE = 'inline';
+  let HOST_MODES = [];
+
   window.addEventListener('message', (event) => {
     const msg = event.data;
     if (!msg || msg.jsonrpc !== '2.0') return;
@@ -104,10 +111,22 @@ const MCP = (() => {
     });
     const hostContext = (res && res.hostContext) || {};
     HOST_CAPS = (res && res.hostCapabilities) || {};
+    // Stable contract: read the host's applied mode + advertised modes.
+    if (hostContext.displayMode) DISPLAY_MODE = hostContext.displayMode;
+    if (Array.isArray(hostContext.availableDisplayModes)) {
+      HOST_MODES = hostContext.availableDisplayModes;
+    }
     applyTheme(hostContext);
     notify('ui/notifications/initialized', {});
     autoResize();
-    on('ui/notifications/host-context-changed', (p) => applyTheme(p || {}));
+    on('ui/notifications/host-context-changed', (p) => {
+      applyTheme(p || {});
+      // Host may move us (or change what it offers) at any time.
+      if (p && p.displayMode) DISPLAY_MODE = p.displayMode;
+      if (p && Array.isArray(p.availableDisplayModes)) {
+        HOST_MODES = p.availableDisplayModes;
+      }
+    });
 
     // The host sends this before tearing us down and SHOULD wait for the
     // reply, which is the only chance a view gets to flush state. Always
@@ -148,8 +167,27 @@ const MCP = (() => {
   // Host capability probe: apps SHOULD check before using an optional feature.
   const hostSupports = (name) => Boolean(HOST_CAPS && HOST_CAPS[name]);
 
+  // --- Display modes (MCP Apps stable, August 2026) ---------------------
+  // Current host-applied mode. Read THIS, not the last requested mode.
+  const getDisplayMode = () => DISPLAY_MODE;
+  // Modes the host advertised. [] = not confirmed; hide mode controls then.
+  const getAvailableDisplayModes = () => HOST_MODES.slice();
+  // Ask the host to move us. Awaits the host's decision and records the
+  // APPLIED mode as truth (the host may keep or substitute a mode).
+  // Returns the applied mode string.
+  async function requestDisplayMode(mode) {
+    if (!HOST_MODES.includes(mode)) {
+      throw new Error('host does not advertise display mode: ' + mode);
+    }
+    const result = await request('ui/request-display-mode', { mode });
+    const applied = (result && result.mode) || DISPLAY_MODE;
+    DISPLAY_MODE = applied;
+    return applied;
+  }
+
   return { init, on, respondTo, request, notify, callTool, openLink,
-           sendMessage, updateContext, requestTeardown, hostSupports };
+           sendMessage, updateContext, requestTeardown, hostSupports,
+           getDisplayMode, getAvailableDisplayModes, requestDisplayMode };
 })();
 
 // Tool payloads arrive as notifications after the handshake.

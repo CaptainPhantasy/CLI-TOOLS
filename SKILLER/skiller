@@ -81,7 +81,7 @@ DOT_DIRS = """
 .wsdash .zai .zcode .zen .zencoder .zlaude .zsh_sessions
 """.split()
 
-STAGING_ROOT = "/Volumes/applebottom/live-caches/codex-marketplace-staging"
+STAGING_ROOT = os.environ.get("SKILLER_STAGING_ROOT", os.path.join(os.path.expanduser("~"), ".local", "share", "skiller", "marketplace"))
 CURATED_INDEX_DIR = os.path.join(STAGING_ROOT, "agent-skills-index")
 
 # ---- global (machine-wide) install ----------------------------------

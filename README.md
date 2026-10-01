@@ -1,115 +1,56 @@
-# CLI-TOOLS
+# Floyd’s CLI Tools
 
-A suite of zero-dependency command-line tools, installed machine-wide, plus
-three MCP Apps servers that expose the same engines to AI hosts.
+![Floyd’s CLI Tools — Floyd’s Labs](assets/hero.jpg)
 
-Every tool follows the same shape: **a vague ask in, an exact artifact out**,
-delivered to your clipboard, framed in the terminal.
+**Five tools. Fewer things to do twice.**
 
-## The tools
+Find useful agent skills, compose prompts, recover unsaved Git work, inventory credentials, and recall commands from your own transcripts. Built at Floyd’s Labs: one garage, two black cats, and tools that have to earn the desk space.
 
-| tool | one line | language |
-|---|---|---|
-| **skiller** | vague ask in, exact SKILL.md out | Python |
-| **prompter** | describe a prompt, get an engineered one | Python |
-| **qglm** | streaming CLI client for GLM models | Go |
-| **lgcy** | TUI client for OpenAI/Anthropic/OpenCode providers | TypeScript |
-| **salvager** | find git work that exists nowhere else | Python |
-| **keyring** | find every credential without showing one | Python |
-| **recaller** | recover a command you already got working once | Python |
+[Download v1.0.0](https://github.com/CaptainPhantasy/CLI-TOOLS/releases/tag/v1.0.0) · [Report a bug](https://github.com/CaptainPhantasy/CLI-TOOLS/issues) · [Floyd’s Labs](https://floyd-labs-proving-ground.captainphantasy.chatgpt.site/open-source)
 
-Each has its own README with design rationale.
+## Get it running
 
-## Install
+Requirements: **Python 3.11+, Git; Node.js 20+ for view tests**.
 
-```bash
-sudo bash install-global.sh     # /usr/local/bin + /usr/local/share
-sudo bash finalize-global.sh    # make shared indexes admin-writable
-sudo bash install-go.sh         # Go toolchain (only needed to build qglm)
-./register-mcp --apply          # register MCP Apps servers with hosts
+Download and unpack the release archive:
+
+```sh
+tar -xzf floyd-cli-tools-1.0.0.tar.gz
+cd floyd-cli-tools-1.0.0
+./install-global.sh
+# Add ~/.local/bin to your PATH, then:
+skiller --help
+salvager --roots /absolute/path/to/projects
 ```
 
-`/usr/local/bin` is on the default macOS PATH, so every account on the
-machine gets the tools with no shell configuration.
+The installer defaults to `~/.local`. For another location, use `./install-global.sh --prefix /absolute/path`. It installs five Python tools and three MCP App servers without copying credentials or personal indexes.
 
-Per-user state (history, sessions, personal config) stays in each user's
-home. Shared indexes and credentials live in `/usr/local/share`, with
-credentials at `0640 root:admin` — never world-readable.
+| Tool | What earns its place |
+| --- | --- |
+| SKILLER | Find and index agent skills |
+| PROMPTER | Browse and compose reusable prompts |
+| SALVAGER | Rank Git work that is still only on disk |
+| KEYRING | Inventory credential locations without printing values |
+| RECALLER | Search commands in your own agent transcripts |
 
-## Layout
+MCP servers: `keyring-app`, `salvager-app`, and `recaller-app` use stdio. Configure their installed absolute executable paths in your host. MCP Apps views require a compatible host; text tools remain available without the view extension. The host must enforce app-only visibility for credential reveal. Optional GLM explanations require your own API configuration and may incur provider charges.
 
-```
-lib/            shared, written once
-  clikit.py       frames, color, GLM streaming, config resolution
-  mcpkit.py       dual-era MCP server (2026-07-28 + legacy handshake)
-  uikit.py        MCP Apps view runtime: handshake, theming, resize
-SKILLER/        skiller
-PROMPTER/       prompter
-SALVAGER/       salvager  + salvager-app  (MCP)
-KEYRING/        keyring   + keyring-app   (MCP)
-RECALLER/       recaller  + recaller-app  (MCP)
-test-mcp-apps   83-check verification suite
-mcp-probe       drive an MCP server over real stdio JSON-RPC
-view-harness.mjs run a view's JS against a fake DOM + fake host
-```
+## What is in the box
 
-`lib/` exists because SKILLER and PROMPTER had each grown their own copy of
-the same ~250 lines of terminal chrome. Three more tools would have meant
-five copies. One fix now lands everywhere.
+The release includes `floyd-cli-tools-1.0.0.tar.gz`, source where applicable, and `SHA256SUMS.txt`. Use the tagged release's named assets for installation; GitHub's automatic source archives are snapshots. Verify a download with `shasum -a 256 -c SHA256SUMS.txt` after downloading the matching files.
 
-## MCP Apps
+## Show the work
 
-Three tools also ship as MCP Apps servers implementing SEP-1865, with
-interactive HTML views that render inline in a compliant host. See
-[MCP-APPS.md](MCP-APPS.md).
+`python3 test-mcp-apps` checks protocol behavior, model-visible secret redaction, narrow write tools, and rendered views using synthetic isolated fixtures. `node view-harness.mjs` is used by that suite. The installer is separately exercised under a temporary prefix.
 
-The headline case is KEYRING: the sandboxed view can reveal a secret **to
-you** while the model still only ever receives fingerprints, enforced by
-`visibility: ["app"]` at the protocol level rather than by string masking.
+## Contribute or get help
 
-## Testing
+Open an issue with your platform, version, command, and a minimal reproduction. Keep credentials and personal transcripts out of reports. See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
 
-```bash
-./test-mcp-apps     # 83 checks across both MCP protocol eras
-```
+## License
 
-Covers protocol conformance, graceful degradation, the security rules, and
-live view rendering. Two harnesses because they catch different failures:
-`mcp-probe` speaks real JSON-RPC; `view-harness.mjs` executes the view's
-JavaScript. Both found real bugs during development.
+The repository has no open-source license granting redistribution rights. Existing restrictions are preserved; a public download does not change those rights.
 
-## Not in this repo
+---
 
-Three directories are deliberately excluded (see `.gitignore`):
-
-- **QGLM/**, **LGCY/**, **MITsh/** — each is already its own git repo with
-  its own history. Tracking them here would either swallow that history or
-  create broken gitlinks. If they should become part of this repo, convert
-  them properly with `git submodule add`.
-
-Also excluded: compiled binaries (rebuildable, 14MB each), build caches,
-`.env` files, and hand-rolled timestamped backups. That last category is
-what this repo replaces.
-
-## Design constraints
-
-**Zero dependencies.** Stdlib Python only; no SDK, no `node_modules`, no
-build step. `qglm` is Go and `lgcy` is TypeScript, but both ship as single
-binaries.
-
-**Read-only by default.** SKILLER, PROMPTER, KEYRING and RECALLER never
-modify your system. SALVAGER's CLI is read-only; only its MCP app can
-write, through two narrow tools that commit or push one named repo and
-never force-push, reset, or discard.
-
-**Secrets are never printed.** KEYRING matches duplicates via salted
-HMAC-SHA256 fingerprints, so it can tell you a key lives in four places
-without ever showing you or a model what it is.
-
-## Storage note
-
-This repo lives on an external USB SSD (`/Volumes/Storage`), and the boot
-volume is *also* an external USB SSD. The installed tools are symlinks into
-this directory, so unmounting the drive breaks all seven for every user.
-Moving the suite under `/usr/local/libexec` would collapse that to a single
-drive dependency.
+Built with intent. Bella checks the keyboard. Bowser watches the router.

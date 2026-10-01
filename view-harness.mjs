@@ -181,5 +181,6 @@ setTimeout(() => {
     }
     console.log(`PASS: handshake + teardown ok, rendered ${rendered.length} chars, `
       + `found ${JSON.stringify(expect)}`);
+    process.exit(0);
   }, 60);
 }, 120);

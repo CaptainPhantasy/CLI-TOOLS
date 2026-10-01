@@ -20,6 +20,8 @@ import subprocess
 import sys
 import tempfile
 import shutil
+import selectors
+import time
 
 TOOLS = os.path.dirname(os.path.realpath(__file__))
 UI_EXT = "io.modelcontextprotocol/ui"
@@ -38,6 +40,25 @@ def modern_meta(ui=True):
             M_INFO: {"name": "test", "version": "1"}}
 
 PASS, FAIL = [], []
+FIXTURE = tempfile.TemporaryDirectory(prefix="cli-tools-fixture-")
+FIXTURE_ROOT = FIXTURE.name
+os.environ["KEYRING_SALT_PATH"] = os.path.join(FIXTURE_ROOT, "salt")
+os.environ["RECALLER_SHARED_HOME"] = os.path.join(FIXTURE_ROOT, "recall")
+os.environ["RECALLER_USER_HOME"] = os.path.join(FIXTURE_ROOT, "recall")
+os.mkdir(os.environ["RECALLER_SHARED_HOME"])
+with open(os.path.join(FIXTURE_ROOT, ".env"), "w") as fh:
+    fh.write("ANTHROPIC_API_KEY=sk-ant-api03-" + "fixture0123456789" * 4 + "\n")
+with open(os.path.join(os.environ["RECALLER_SHARED_HOME"], "index.json"), "w") as fh:
+    json.dump({"commands": 1, "sessions": 1, "entries": [{"path":"fixture.jsonl", "harness":"codex", "mtime":time.time(), "cwd":FIXTURE_ROOT, "prompts":["keychain vault"], "commands":[{"cmd":"keychain vault list", "ok":True}]}]},fh)
+FIXTURE_REPO=os.path.join(FIXTURE_ROOT,"fixture-repo")
+subprocess.run(["git","init","-q",FIXTURE_REPO],check=True)
+subprocess.run(["git","-C",FIXTURE_REPO,"config","user.name","fixture"],check=True)
+subprocess.run(["git","-C",FIXTURE_REPO,"config","user.email","fixture@example.invalid"],check=True)
+with open(os.path.join(FIXTURE_REPO,"changed.txt"),"w") as fh: fh.write("fixture")
+subprocess.run(["git","-C",FIXTURE_REPO,"add","changed.txt"],check=True)
+subprocess.run(["git","-C",FIXTURE_REPO,"commit","-qm","fixture"],check=True)
+with open(os.path.join(FIXTURE_REPO,"changed.txt"),"a") as fh: fh.write("modified")
+
 
 
 def check(name, ok, detail=""):
@@ -73,6 +94,9 @@ class Probe:
             "jsonrpc": "2.0", "id": self.id, "method": method,
             "params": params}) + "\n")
         self.p.stdin.flush()
+        with selectors.DefaultSelector() as ready:
+            ready.register(self.p.stdout, selectors.EVENT_READ)
+            if not ready.select(10): raise TimeoutError("MCP response exceeded 10 seconds")
         line = self.p.stdout.readline()
         if not line:
             raise RuntimeError("server died: " + self.p.stderr.read()[:400])
@@ -231,7 +255,7 @@ def test_keyring_security():
               f"visible: {tools}")
 
         scan = pr.call("tools/call",
-                       {"name": "scan_credentials", "arguments": {}})["result"]
+                       {"name": "scan_credentials", "arguments": {"roots": [FIXTURE_ROOT]}})["result"]
         secrets = scan["structuredContent"]["secrets"]
 
         # Everything a model could ever receive from this server.
@@ -239,14 +263,14 @@ def test_keyring_security():
                    + json.dumps(scan)
                    + json.dumps(pr.call("resources/read", {"uri": uri})))
 
-        # Real secrets, re-derived from disk via the app-only path.
+        # Synthetic values re-derived through the app-only path.
         values = []
         for g in secrets:
             r = pr.call("tools/call", {"name": "reveal_secret",
                                        "arguments": {"fingerprint": g["fp"]}})
             if "result" in r:
                 values.append(r["result"]["structuredContent"]["value"])
-        check("app-only reveal returns real values", len(values) > 0,
+        check("app-only reveal returns fixture values", len(values) > 0,
               f"{len(values)} revealed")
 
         leaks = [v[:8] for v in values if len(v) >= 20 and v in surface]
@@ -305,8 +329,8 @@ def test_salvager_safety():
 def test_views():
     print("\nBEHAVIOUR — views render real data in a simulated host")
     fixtures = {
-        "keyring": ("scan_credentials", {}, "kimi-code"),
-        "salvager": ("scan_repos", {"roots": [TOOLS]}, "CLITOOLS"),
+        "keyring": ("scan_credentials", {"roots": [FIXTURE_ROOT]}, "anthropic"),
+        "salvager": ("scan_repos", {"roots": [FIXTURE_ROOT]}, "fixture-repo"),
         "recaller": ("search_commands", {"query": "keychain vault"}, "keychain"),
     }
     tmp = tempfile.mkdtemp()

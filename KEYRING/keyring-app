@@ -254,8 +254,12 @@ srv.resource(
 )
 
 
+_LAST_ROOTS = None
+
 def _scan(roots=None):
-    findings, nfiles = keyring_cli.sweep(roots or keyring_cli.user_homes())
+    global _LAST_ROOTS
+    _LAST_ROOTS = tuple(roots or keyring_cli.user_homes())
+    findings, nfiles = keyring_cli.sweep(_LAST_ROOTS)
     groups = keyring_cli.group_by_secret(findings)
     return groups, nfiles
 
@@ -312,7 +316,7 @@ def reveal_secret(fingerprint):
     The value is deliberately NOT stored anywhere between the scan and
     this call: we re-derive it from disk so nothing lingers in memory or
     in a cache that could later be serialized into a transcript."""
-    findings, _ = keyring_cli.sweep(keyring_cli.user_homes())
+    findings, _ = keyring_cli.sweep(_LAST_ROOTS or keyring_cli.user_homes())
     match = next((f for f in findings if f["fp"] == fingerprint), None)
     if not match:
         raise JsonRpcError(-32602, "unknown fingerprint")
@@ -346,7 +350,7 @@ def reveal_secret(fingerprint):
 )
 def tighten_permissions(path):
     # Only ever narrows access, and only for a file we actually flagged.
-    findings, _ = keyring_cli.sweep(keyring_cli.user_homes())
+    findings, _ = keyring_cli.sweep(_LAST_ROOTS or keyring_cli.user_homes())
     known = {f["path"] for f in findings}
     if path not in known:
         raise JsonRpcError(-32602,

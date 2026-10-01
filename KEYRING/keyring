@@ -129,7 +129,7 @@ PLACEHOLDER = re.compile(
 def machine_salt():
     """Per-machine salt so fingerprints can't be compared across hosts or
     reversed with a precomputed table. Stored 0600 in the user's home."""
-    path = os.path.join(os.path.expanduser("~"), ".keyring-salt")
+    path = os.environ.get("KEYRING_SALT_PATH", os.path.join(os.path.expanduser("~"), ".keyring-salt"))
     try:
         with open(path, "rb") as fh:
             data = fh.read().strip()
